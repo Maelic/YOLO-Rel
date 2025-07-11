@@ -876,7 +876,7 @@ class Metric(SimpleClass):
         return self.all_ap.mean() if len(self.all_ap) else 0.0
 
     def mean_results(self) -> List[float]:
-        """Return mean of results, mp, mr, map50, map."""
+        """Return mean of results, mp, mr, map50, and map."""
         return [self.mp, self.mr, self.map50, self.map]
 
     def class_result(self, i: int) -> Tuple[float, float, float, float]:
@@ -1097,93 +1097,132 @@ class DetMetrics(SimpleClass, DataExportMixin):
         ]
 
 
-class SegmentMetrics(DetMetrics):
+class SegmentMetrics(SimpleClass):
     """
-    Calculate and aggregate detection and segmentation metrics over a given set of classes.
+    Calculates and aggregates detection and segmentation metrics over a given set of classes.
+
+    Args:
+        save_dir (Path): Path to the directory where the output plots should be saved. Default is the current directory.
+        plot (bool): Whether to save the detection and segmentation plots. Default is False.
+        names (list): List of class names. Default is an empty list.
 
     Attributes:
-        names (Dict[int, str]): Dictionary of class names.
-        box (Metric): An instance of the Metric class for storing detection results.
+        save_dir (Path): Path to the directory where the output plots should be saved.
+        plot (bool): Whether to save the detection and segmentation plots.
+        names (list): List of class names.
+        box (Metric): An instance of the Metric class to calculate box detection metrics.
         seg (Metric): An instance of the Metric class to calculate mask segmentation metrics.
-        speed (Dict[str, float]): A dictionary for storing execution times of different parts of the detection process.
-        task (str): The task type, set to 'segment'.
-        stats (Dict[str, List]): A dictionary containing lists for true positives, confidence scores, predicted classes, target classes, and target images.
-        nt_per_class: Number of targets per class.
-        nt_per_image: Number of targets per image.
+        speed (dict): Dictionary to store the time taken in different phases of inference.
+
+    Methods:
+        process(tp_m, tp_b, conf, pred_cls, target_cls): Processes metrics over the given set of predictions.
+        mean_results(): Returns the mean of the detection and segmentation metrics over all the classes.
+        class_result(i): Returns the detection and segmentation metrics of class `i`.
+        maps: Returns the mean Average Precision (mAP) scores for IoU thresholds ranging from 0.50 to 0.95.
+        fitness: Returns the fitness scores, which are a single weighted combination of metrics.
+        ap_class_index: Returns the list of indices of classes used to compute Average Precision (AP).
+        results_dict: Returns the dictionary containing all the detection and segmentation metrics and fitness score.
     """
 
-    def __init__(self, names: Dict[int, str] = {}) -> None:
-        """
-        Initialize a SegmentMetrics instance with a save directory, plot flag, and class names.
-
-        Args:
-            names (Dict[int, str], optional): Dictionary of class names.
-        """
-        DetMetrics.__init__(self, names)
+    def __init__(self, save_dir=Path("."), plot=False, names=()) -> None:
+        """Initialize a SegmentMetrics instance with a save directory, plot flag, callback function, and class names."""
+        self.save_dir = save_dir
+        self.plot = plot
+        self.names = names
+        self.box = Metric()
         self.seg = Metric()
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "segment"
-        self.stats["tp_m"] = []  # add additional stats for masks
 
-    def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> Dict[str, np.ndarray]:
+    def process(self, tp, tp_m, conf, pred_cls, target_cls, on_plot=None):
         """
-        Process the detection and segmentation metrics over the given set of predictions.
+        Processes the detection and segmentation metrics over the given set of predictions.
 
         Args:
-            save_dir (Path): Directory to save plots. Defaults to Path(".").
-            plot (bool): Whether to plot precision-recall curves. Defaults to False.
-            on_plot (callable, optional): Function to call after plots are generated. Defaults to None.
-
-        Returns:
-            (Dict[str, np.ndarray]): Dictionary containing concatenated statistics arrays.
+            tp (list): List of True Positive boxes.
+            tp_m (list): List of True Positive masks.
+            conf (list): List of confidence scores.
+            pred_cls (list): List of predicted classes.
+            target_cls (list): List of target classes.
+            on_plot (func): An optional callback to pass plots path and data when they are rendered. Defaults to None.
         """
-        stats = DetMetrics.process(self, save_dir, plot, on_plot=on_plot)  # process box stats
         results_mask = ap_per_class(
-            stats["tp_m"],
-            stats["conf"],
-            stats["pred_cls"],
-            stats["target_cls"],
-            plot=plot,
+            tp_m,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
             on_plot=on_plot,
-            save_dir=save_dir,
+            save_dir=self.save_dir,
             names=self.names,
             prefix="Mask",
         )[2:]
         self.seg.nc = len(self.names)
         self.seg.update(results_mask)
-        return stats
+        results_box = ap_per_class(
+            tp,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
+            on_plot=on_plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            prefix="Box",
+        )[2:]
+        self.box.nc = len(self.names)
+        self.box.update(results_box)
 
     @property
-    def keys(self) -> List[str]:
-        """Return a list of keys for accessing metrics."""
-        return DetMetrics.keys.fget(self) + [
+    def keys(self):
+        """Returns a list of keys for accessing metrics."""
+        return [
+            "metrics/precision(B)",
+            "metrics/recall(B)",
+            "metrics/mAP50(B)",
+            "metrics/mAP50-95(B)",
             "metrics/precision(M)",
             "metrics/recall(M)",
             "metrics/mAP50(M)",
             "metrics/mAP50-95(M)",
         ]
 
-    def mean_results(self) -> List[float]:
+    def mean_results(self):
         """Return the mean metrics for bounding box and segmentation results."""
-        return DetMetrics.mean_results(self) + self.seg.mean_results()
+        return self.box.mean_results() + self.seg.mean_results()
 
-    def class_result(self, i: int) -> List[float]:
-        """Return classification results for a specified class index."""
-        return DetMetrics.class_result(self, i) + self.seg.class_result(i)
-
-    @property
-    def maps(self) -> np.ndarray:
-        """Return mAP scores for object detection and semantic segmentation models."""
-        return DetMetrics.maps.fget(self) + self.seg.maps
+    def class_result(self, i):
+        """Returns classification results for a specified class index."""
+        return self.box.class_result(i) + self.seg.class_result(i)
 
     @property
-    def fitness(self) -> float:
-        """Return the fitness score for both segmentation and bounding box models."""
-        return self.seg.fitness() + DetMetrics.fitness.fget(self)
+    def maps(self):
+        """Returns mAP scores for object detection and semantic segmentation models."""
+        return self.box.maps + self.seg.maps
 
     @property
-    def curves(self) -> List[str]:
-        """Return a list of curves for accessing specific metrics curves."""
-        return DetMetrics.curves.fget(self) + [
+    def fitness(self):
+        """Get the fitness score for both segmentation and bounding box models."""
+        return self.seg.fitness() + self.box.fitness()
+
+    @property
+    def ap_class_index(self):
+        """Boxes and masks have the same ap_class_index."""
+        return self.box.ap_class_index
+
+    @property
+    def results_dict(self):
+        """Returns results of object detection model for evaluation."""
+        return dict(zip(self.keys + ["fitness"], self.mean_results() + [self.fitness]))
+
+    @property
+    def curves(self):
+        """Returns a list of curves for accessing specific metrics curves."""
+        return [
+            "Precision-Recall(B)",
+            "F1-Confidence(B)",
+            "Precision-Confidence(B)",
+            "Recall-Confidence(B)",
             "Precision-Recall(M)",
             "F1-Confidence(M)",
             "Precision-Confidence(M)",
@@ -1191,134 +1230,124 @@ class SegmentMetrics(DetMetrics):
         ]
 
     @property
-    def curves_results(self) -> List[List]:
-        """Return dictionary of computed performance metrics and statistics."""
-        return DetMetrics.curves_results.fget(self) + self.seg.curves_results
-
-    def summary(self, normalize: bool = True, decimals: int = 5) -> List[Dict[str, Any]]:
-        """
-        Generate a summarized representation of per-class segmentation metrics as a list of dictionaries. Includes both
-        box and mask scalar metrics (mAP, mAP50, mAP75) alongside precision, recall, and F1-score for each class.
-
-        Args:
-            normalize (bool): For Segment metrics, everything is normalized  by default [0-1].
-            decimals (int): Number of decimal places to round the metrics values to.
-
-        Returns:
-            (List[Dict[str, Any]]): A list of dictionaries, each representing one class with corresponding metric values.
-
-        Examples:
-            >>> results = model.val(data="coco8-seg.yaml")
-            >>> seg_summary = results.summary(decimals=4)
-            >>> print(seg_summary)
-        """
-        per_class = {
-            "Mask-P": self.seg.p,
-            "Mask-R": self.seg.r,
-            "Mask-F1": self.seg.f1,
-        }
-        summary = DetMetrics.summary(self, normalize, decimals)  # get box summary
-        for i, s in enumerate(summary):
-            s.update({**{k: round(v[i], decimals) for k, v in per_class.items()}})
-        return summary
+    def curves_results(self):
+        """Returns dictionary of computed performance metrics and statistics."""
+        return self.box.curves_results + self.seg.curves_results
 
 
-class PoseMetrics(DetMetrics):
+class PoseMetrics(SegmentMetrics):
     """
-    Calculate and aggregate detection and pose metrics over a given set of classes.
+    Calculates and aggregates detection and pose metrics over a given set of classes.
+
+    Args:
+        save_dir (Path): Path to the directory where the output plots should be saved. Default is the current directory.
+        plot (bool): Whether to save the detection and segmentation plots. Default is False.
+        names (list): List of class names. Default is an empty list.
 
     Attributes:
-        names (Dict[int, str]): Dictionary of class names.
-        pose (Metric): An instance of the Metric class to calculate pose metrics.
-        box (Metric): An instance of the Metric class for storing detection results.
-        speed (Dict[str, float]): A dictionary for storing execution times of different parts of the detection process.
-        task (str): The task type, set to 'pose'.
-        stats (Dict[str, List]): A dictionary containing lists for true positives, confidence scores, predicted classes, target classes, and target images.
-        nt_per_class: Number of targets per class.
-        nt_per_image: Number of targets per image.
+        save_dir (Path): Path to the directory where the output plots should be saved.
+        plot (bool): Whether to save the detection and segmentation plots.
+        names (list): List of class names.
+        box (Metric): An instance of the Metric class to calculate box detection metrics.
+        pose (Metric): An instance of the Metric class to calculate mask segmentation metrics.
+        speed (dict): Dictionary to store the time taken in different phases of inference.
 
     Methods:
-        process(tp_m, tp_b, conf, pred_cls, target_cls): Process metrics over the given set of predictions.
-        mean_results(): Return the mean of the detection and segmentation metrics over all the classes.
-        class_result(i): Return the detection and segmentation metrics of class `i`.
-        maps: Return the mean Average Precision (mAP) scores for IoU thresholds ranging from 0.50 to 0.95.
-        fitness: Return the fitness scores, which are a single weighted combination of metrics.
-        ap_class_index: Return the list of indices of classes used to compute Average Precision (AP).
-        results_dict: Return the dictionary containing all the detection and segmentation metrics and fitness score.
+        process(tp_m, tp_b, conf, pred_cls, target_cls): Processes metrics over the given set of predictions.
+        mean_results(): Returns the mean of the detection and segmentation metrics over all the classes.
+        class_result(i): Returns the detection and segmentation metrics of class `i`.
+        maps: Returns the mean Average Precision (mAP) scores for IoU thresholds ranging from 0.50 to 0.95.
+        fitness: Returns the fitness scores, which are a single weighted combination of metrics.
+        ap_class_index: Returns the list of indices of classes used to compute Average Precision (AP).
+        results_dict: Returns the dictionary containing all the detection and segmentation metrics and fitness score.
     """
 
-    def __init__(self, names: Dict[int, str] = {}) -> None:
-        """
-        Initialize the PoseMetrics class with directory path, class names, and plotting options.
-
-        Args:
-            names (Dict[int, str], optional): Dictionary of class names.
-        """
-        super().__init__(names)
+    def __init__(self, save_dir=Path("."), plot=False, names=()) -> None:
+        """Initialize the PoseMetrics class with directory path, class names, and plotting options."""
+        super().__init__(save_dir, plot, names)
+        self.save_dir = save_dir
+        self.plot = plot
+        self.names = names
+        self.box = Metric()
         self.pose = Metric()
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "pose"
-        self.stats["tp_p"] = []  # add additional stats for pose
 
-    def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> Dict[str, np.ndarray]:
+    def process(self, tp, tp_p, conf, pred_cls, target_cls, on_plot=None):
         """
-        Process the detection and pose metrics over the given set of predictions.
+        Processes the detection and pose metrics over the given set of predictions.
 
         Args:
-            save_dir (Path): Directory to save plots. Defaults to Path(".").
-            plot (bool): Whether to plot precision-recall curves. Defaults to False.
-            on_plot (callable, optional): Function to call after plots are generated.
-
-        Returns:
-            (Dict[str, np.ndarray]): Dictionary containing concatenated statistics arrays.
+            tp (list): List of True Positive boxes.
+            tp_p (list): List of True Positive keypoints.
+            conf (list): List of confidence scores.
+            pred_cls (list): List of predicted classes.
+            target_cls (list): List of target classes.
+            on_plot (func): An optional callback to pass plots path and data when they are rendered. Defaults to None.
         """
-        stats = DetMetrics.process(self, save_dir, plot, on_plot=on_plot)  # process box stats
         results_pose = ap_per_class(
-            stats["tp_p"],
-            stats["conf"],
-            stats["pred_cls"],
-            stats["target_cls"],
-            plot=plot,
+            tp_p,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
             on_plot=on_plot,
-            save_dir=save_dir,
+            save_dir=self.save_dir,
             names=self.names,
             prefix="Pose",
         )[2:]
         self.pose.nc = len(self.names)
         self.pose.update(results_pose)
-        return stats
+        results_box = ap_per_class(
+            tp,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
+            on_plot=on_plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            prefix="Box",
+        )[2:]
+        self.box.nc = len(self.names)
+        self.box.update(results_box)
 
     @property
-    def keys(self) -> List[str]:
-        """Return list of evaluation metric keys."""
-        return DetMetrics.keys.fget(self) + [
+    def keys(self):
+        """Returns list of evaluation metric keys."""
+        return [
+            "metrics/precision(B)",
+            "metrics/recall(B)",
+            "metrics/mAP50(B)",
+            "metrics/mAP50-95(B)",
             "metrics/precision(P)",
             "metrics/recall(P)",
             "metrics/mAP50(P)",
             "metrics/mAP50-95(P)",
         ]
 
-    def mean_results(self) -> List[float]:
+    def mean_results(self):
         """Return the mean results of box and pose."""
-        return DetMetrics.mean_results(self) + self.pose.mean_results()
+        return self.box.mean_results() + self.pose.mean_results()
 
-    def class_result(self, i: int) -> List[float]:
+    def class_result(self, i):
         """Return the class-wise detection results for a specific class i."""
-        return DetMetrics.class_result(self, i) + self.pose.class_result(i)
+        return self.box.class_result(i) + self.pose.class_result(i)
 
     @property
-    def maps(self) -> np.ndarray:
-        """Return the mean average precision (mAP) per class for both box and pose detections."""
-        return DetMetrics.maps.fget(self) + self.pose.maps
+    def maps(self):
+        """Returns the mean average precision (mAP) per class for both box and pose detections."""
+        return self.box.maps + self.pose.maps
 
     @property
-    def fitness(self) -> float:
-        """Return combined fitness score for pose and box detection."""
-        return self.pose.fitness() + DetMetrics.fitness.fget(self)
+    def fitness(self):
+        """Computes classification metrics and speed using the `targets` and `pred` inputs."""
+        return self.pose.fitness() + self.box.fitness()
 
     @property
-    def curves(self) -> List[str]:
-        """Return a list of curves for accessing specific metrics curves."""
-        return DetMetrics.curves.fget(self) + [
+    def curves(self):
+        """Returns a list of curves for accessing specific metrics curves."""
+        return [
             "Precision-Recall(B)",
             "F1-Confidence(B)",
             "Precision-Confidence(B)",
@@ -1330,47 +1359,25 @@ class PoseMetrics(DetMetrics):
         ]
 
     @property
-    def curves_results(self) -> List[List]:
-        """Return dictionary of computed performance metrics and statistics."""
-        return DetMetrics.curves_results.fget(self) + self.pose.curves_results
-
-    def summary(self, normalize: bool = True, decimals: int = 5) -> List[Dict[str, Any]]:
-        """
-        Generate a summarized representation of per-class pose metrics as a list of dictionaries. Includes both box and
-        pose scalar metrics (mAP, mAP50, mAP75) alongside precision, recall, and F1-score for each class.
-
-        Args:
-            normalize (bool): For Pose metrics, everything is normalized  by default [0-1].
-            decimals (int): Number of decimal places to round the metrics values to.
-
-        Returns:
-            (List[Dict[str, Any]]): A list of dictionaries, each representing one class with corresponding metric values.
-
-        Examples:
-            >>> results = model.val(data="coco8-pose.yaml")
-            >>> pose_summary = results.summary(decimals=4)
-            >>> print(pose_summary)
-        """
-        per_class = {
-            "Pose-P": self.pose.p,
-            "Pose-R": self.pose.r,
-            "Pose-F1": self.pose.f1,
-        }
-        summary = DetMetrics.summary(self, normalize, decimals)  # get box summary
-        for i, s in enumerate(summary):
-            s.update({**{k: round(v[i], decimals) for k, v in per_class.items()}})
-        return summary
+    def curves_results(self):
+        """Returns dictionary of computed performance metrics and statistics."""
+        return self.box.curves_results + self.pose.curves_results
 
 
-class ClassifyMetrics(SimpleClass, DataExportMixin):
+class ClassifyMetrics(SimpleClass):
     """
     Class for computing classification metrics including top-1 and top-5 accuracy.
 
     Attributes:
         top1 (float): The top-1 accuracy.
         top5 (float): The top-5 accuracy.
-        speed (dict): A dictionary containing the time taken for each step in the pipeline.
-        task (str): The task type, set to 'classify'.
+        speed (Dict[str, float]): A dictionary containing the time taken for each step in the pipeline.
+        fitness (float): The fitness of the model, which is equal to top-5 accuracy.
+        results_dict (Dict[str, Union[float, str]]): A dictionary containing the classification metrics and fitness.
+        keys (List[str]): A list of keys for the results_dict.
+
+    Methods:
+        process(targets, pred): Processes the targets and predictions to compute classification metrics.
     """
 
     def __init__(self) -> None:
@@ -1380,87 +1387,482 @@ class ClassifyMetrics(SimpleClass, DataExportMixin):
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "classify"
 
-    def process(self, targets: torch.Tensor, pred: torch.Tensor):
-        """
-        Process target classes and predicted classes to compute metrics.
-
-        Args:
-            targets (torch.Tensor): Target classes.
-            pred (torch.Tensor): Predicted classes.
-        """
+    def process(self, targets, pred):
+        """Target classes and predicted classes."""
         pred, targets = torch.cat(pred), torch.cat(targets)
         correct = (targets[:, None] == pred).float()
         acc = torch.stack((correct[:, 0], correct.max(1).values), dim=1)  # (top1, top5) accuracy
         self.top1, self.top5 = acc.mean(0).tolist()
 
     @property
-    def fitness(self) -> float:
-        """Return mean of top-1 and top-5 accuracies as fitness score."""
+    def fitness(self):
+        """Returns mean of top-1 and top-5 accuracies as fitness score."""
         return (self.top1 + self.top5) / 2
 
     @property
-    def results_dict(self) -> Dict[str, float]:
-        """Return a dictionary with model's performance metrics and fitness score."""
+    def results_dict(self):
+        """Returns a dictionary with model's performance metrics and fitness score."""
         return dict(zip(self.keys + ["fitness"], [self.top1, self.top5, self.fitness]))
 
     @property
-    def keys(self) -> List[str]:
-        """Return a list of keys for the results_dict property."""
+    def keys(self):
+        """Returns a list of keys for the results_dict property."""
         return ["metrics/accuracy_top1", "metrics/accuracy_top5"]
 
     @property
-    def curves(self) -> List:
-        """Return a list of curves for accessing specific metrics curves."""
+    def curves(self):
+        """Returns a list of curves for accessing specific metrics curves."""
         return []
 
     @property
-    def curves_results(self) -> List:
-        """Return a list of curves for accessing specific metrics curves."""
+    def curves_results(self):
+        """Returns a list of curves for accessing specific metrics curves."""
         return []
 
-    def summary(self, normalize: bool = True, decimals: int = 5) -> List[Dict[str, float]]:
-        """
-        Generate a single-row summary of classification metrics (Top-1 and Top-5 accuracy).
 
-        Args:
-            normalize (bool): For Classify metrics, everything is normalized  by default [0-1].
-            decimals (int): Number of decimal places to round the metrics values to.
+class OBBMetrics(SimpleClass):
+    """Metrics for evaluating oriented bounding box (OBB) detection, see https://arxiv.org/pdf/2106.06072.pdf."""
 
-        Returns:
-            (List[Dict[str, float]]): A list with one dictionary containing Top-1 and Top-5 classification accuracy.
+    def __init__(self, save_dir=Path("."), plot=False, names=()) -> None:
+        """Initialize an OBBMetrics instance with directory, plotting, callback, and class names."""
+        self.save_dir = save_dir
+        self.plot = plot
+        self.names = names
+        self.box = Metric()
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
 
-        Examples:
-            >>> results = model.val(data="imagenet10")
-            >>> classify_summary = results.summary(decimals=4)
-            >>> print(classify_summary)
-        """
-        return [{"top1_acc": round(self.top1, decimals), "top5_acc": round(self.top5, decimals)}]
+    def process(self, tp, conf, pred_cls, target_cls, on_plot=None):
+        """Process predicted results for object detection and update metrics."""
+        results = ap_per_class(
+            tp,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            on_plot=on_plot,
+        )[2:]
+        self.box.nc = len(self.names)
+        self.box.update(results)
 
+    @property
+    def keys(self):
+        """Returns a list of keys for accessing specific metrics."""
+        return ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]
 
-class OBBMetrics(DetMetrics):
+    def mean_results(self):
+        """Calculate mean of detected objects & return precision, recall, mAP50, and mAP50-95."""
+        return self.box.mean_results()
+
+    def class_result(self, i):
+        """Return the result of evaluating the performance of an object detection model on a specific class."""
+        return self.box.class_result(i)
+
+    @property
+    def maps(self):
+        """Returns mean Average Precision (mAP) scores per class."""
+        return self.box.maps
+
+    @property
+    def fitness(self):
+        """Returns the fitness of box object."""
+        return self.box.fitness()
+
+    @property
+    def ap_class_index(self):
+        """Returns the average precision index per class."""
+        return self.box.ap_class_index
+
+    @property
+    def results_dict(self):
+        """Returns dictionary of computed performance metrics and statistics."""
+        return dict(zip(self.keys + ["fitness"], self.mean_results() + [self.fitness]))
+
+    @property
+    def curves(self):
+        """Returns a list of curves for accessing specific metrics curves."""
+        return []
+
+    @property
+    def curves_results(self):
+        """Returns a list of curves for accessing specific metrics curves."""
+        return []
+
+def relation_recall(pred_relations, gt_relations, topk=(20, 50, 100)):
     """
-    Metrics for evaluating oriented bounding box (OBB) detection.
+    Calculate Recall@K for relation prediction.
+    
+    Args:
+        pred_relations (List): List of predicted relations [(subj_idx, obj_idx, rel_cls, conf), ...]
+        gt_relations (List): List of ground truth relations [(subj_idx, obj_idx, rel_cls), ...]
+        topk (Tuple): K values for evaluation
+        
+    Returns:
+        Dict[int, float]: Dictionary mapping K to Recall@K values
+    """
+    if not gt_relations:
+        return {k: 0.0 for k in topk}
+    
+    # Convert ground truth to set for faster lookup
+    gt_set = set((subj, obj, rel) for subj, obj, rel in gt_relations)
+    
+    recalls = {}
+    for k in topk:
+        # Take top-k predictions
+        top_k_preds = pred_relations[:k]
+        
+        # Count correct predictions
+        correct = 0
+        for subj, obj, rel_cls, conf in top_k_preds:
+            if (subj, obj, rel_cls) in gt_set:
+                correct += 1
+        
+        # Calculate recall@k
+        recalls[k] = correct / len(gt_relations) if gt_relations else 0.0
+    
+    return recalls
 
+
+def relation_recall_per_class(pred_relations, gt_relations, num_classes, topk=(20, 50, 100)):
+    """
+    Calculate per-class Recall@K for relation prediction.
+    
+    Args:
+        pred_relations (List): List of predicted relations [(subj_idx, obj_idx, rel_cls, conf), ...]
+        gt_relations (List): List of ground truth relations [(subj_idx, obj_idx, rel_cls), ...]
+        num_classes (int): Number of relation classes
+        topk (Tuple): K values for evaluation
+        
+    Returns:
+        Dict[int, np.ndarray]: Dictionary mapping K to per-class Recall@K arrays
+    """
+    import numpy as np
+    
+    # Group ground truth by class
+    gt_by_class = {}
+    for subj, obj, rel_cls in gt_relations:
+        if rel_cls not in gt_by_class:
+            gt_by_class[rel_cls] = set()
+        gt_by_class[rel_cls].add((subj, obj, rel_cls))
+    
+    recalls_per_class = {}
+    for k in topk:
+        class_recalls = np.zeros(num_classes)
+        
+        # Take top-k predictions
+        top_k_preds = pred_relations[:k]
+        
+        for cls_id in range(num_classes):
+            if cls_id not in gt_by_class:
+                class_recalls[cls_id] = 0.0
+                continue
+            
+            gt_for_class = gt_by_class[cls_id]
+            
+            # Count correct predictions for this class
+            correct = 0
+            for subj, obj, rel_cls, conf in top_k_preds:
+                if rel_cls == cls_id and (subj, obj, rel_cls) in gt_for_class:
+                    correct += 1
+            
+            # Calculate recall@k for this class
+            class_recalls[cls_id] = correct / len(gt_for_class) if gt_for_class else 0.0
+        
+        recalls_per_class[k] = class_recalls
+    
+    return recalls_per_class
+
+
+class RelMetrics(SimpleClass):
+    """
+    Metrics for evaluating relation prediction performance.
+    
+    This class calculates both detection metrics and relation metrics:
+    - Detection metrics: precision, recall, mAP50, mAP50-95
+    - Relation metrics: Recall@K and MeanRecall@K for K in [20, 50, 100]
+    
+    Args:
+        save_dir (Path): Path to save evaluation plots.
+        plot (bool): Whether to generate plots.
+        names (dict): Object class names mapping.
+        
     Attributes:
-        names (Dict[int, str]): Dictionary of class names.
-        box (Metric): An instance of the Metric class for storing detection results.
+        save_dir (Path): Directory to save plots.
+        plot (bool): Whether to generate plots.
+        names (dict): Object class names.
+        box (Metric): Metrics for object detection.
         speed (Dict[str, float]): A dictionary for storing execution times of different parts of the detection process.
-        task (str): The task type, set to 'obb'.
+        task (str): The task type, set to 'relation'.
         stats (Dict[str, List]): A dictionary containing lists for true positives, confidence scores, predicted classes, target classes, and target images.
         nt_per_class: Number of targets per class.
         nt_per_image: Number of targets per image.
-
-    References:
-        https://arxiv.org/pdf/2106.06072.pdf
     """
 
-    def __init__(self, names: Dict[int, str] = {}) -> None:
-        """
-        Initialize an OBBMetrics instance with directory, plotting, and class names.
+    def __init__(self, save_dir=Path("."), plot=False, names={}) -> None:
+        """Initialize RelMetrics with directory, plot flag, and class names."""
+        self.save_dir = save_dir
+        self.plot = plot
+        self.names = names
+        self.box = Metric()  # For detection metrics
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+        self.task = "relation"
+        
+        # Relation-specific metrics
+        self.topk = (20, 50, 100)  # K values for evaluation
+        self.relation_recalls = {k: [] for k in self.topk}  # Recall@K values
+        self.relation_mean_recalls = {k: [] for k in self.topk}  # MeanRecall@K values
+        self.relation_class_counts = {}  # Count of relation instances by class
+        self.relation_names = {}  # Relation class names
+        self.nr = 1  # Number of relation classes
+        
+    def process(self, tp, conf, pred_cls, target_cls, on_plot=None):
+        """Process predicted results for object detection and update metrics."""
+        results = ap_per_class(
+            tp,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            on_plot=on_plot,
+        )[2:]
+        self.box.nc = len(self.names)
+        self.box.update(results)
 
-        Args:
-            names (Dict[int, str], optional): Dictionary of class names.
+    def process_relation_stats(self, pred_relations, gt_relations, relation_names=None):
         """
-        DetMetrics.__init__(self, names)
-        # TODO: probably remove task as well
-        self.task = "obb"
+        Process relation predictions and update relation metrics.
+        
+        Args:
+            pred_relations (List): List of predicted relations [(subj_idx, obj_idx, rel_cls, conf), ...]
+            gt_relations (List): List of ground truth relations [(subj_idx, obj_idx, rel_cls), ...]
+            relation_names (dict, optional): Dictionary mapping relation class IDs to names.
+        """
+        if relation_names:
+            self.relation_names = relation_names
+            self.nr = len(relation_names)
+        
+        if not gt_relations:
+            # No ground truth relations, set all metrics to 0
+            for k in self.topk:
+                self.relation_recalls[k].append(0.0)
+                self.relation_mean_recalls[k].append(0.0)
+            return
+        
+        # Count relation instances by class
+        unique_classes = set(rel_cls for _, _, rel_cls in gt_relations)
+        for cls_id in unique_classes:
+            count = sum(1 for _, _, rel_cls in gt_relations if rel_cls == cls_id)
+            self.relation_class_counts[int(cls_id)] = self.relation_class_counts.get(int(cls_id), 0) + count
+        
+        # Sort predicted relations by confidence (descending)
+        pred_relations_sorted = sorted(pred_relations, key=lambda x: x[3], reverse=True)
+        
+        # Calculate Recall@K
+        recalls = relation_recall(pred_relations_sorted, gt_relations, topk=self.topk)
+        for k, r in recalls.items():
+            self.relation_recalls[k].append(r)
+        
+        # Calculate per-class Recall@K
+        recalls_per_class = relation_recall_per_class(
+            pred_relations_sorted, gt_relations, self.nr, topk=self.topk
+        )
+        
+        # Calculate MeanRecall@K (average over classes with ground truth)
+        for k, per_class_recall in recalls_per_class.items():
+            # Only consider classes that have ground truth instances
+            valid_classes = [i for i in range(self.nr) if i in unique_classes]
+            if valid_classes:
+                valid_recalls = per_class_recall[valid_classes]
+                mean_recall = valid_recalls.mean() if len(valid_recalls) > 0 else 0.0
+                self.relation_mean_recalls[k].append(mean_recall)
+            else:
+                self.relation_mean_recalls[k].append(0.0)
+
+    @property
+    def keys(self):
+        """Returns list of evaluation metric keys."""
+        detection_keys = [
+            "metrics/precision(B)", 
+            "metrics/recall(B)", 
+            "metrics/mAP50(B)", 
+            "metrics/mAP50-95(B)"
+        ]
+        relation_keys = []
+        for k in self.topk:
+            relation_keys.extend([
+                f"metrics/Recall@{k}(R)",
+                f"metrics/MeanRecall@{k}(R)"
+            ])
+        return detection_keys + relation_keys
+
+    def mean_results(self):
+        """Return the mean results for detection and relation metrics."""
+        # Detection metrics
+        detection_results = self.box.mean_results()
+        
+        # Relation metrics
+        relation_results = []
+        for k in self.topk:
+            # Add Recall@K
+            if self.relation_recalls[k]:
+                relation_results.append(np.mean(self.relation_recalls[k]))
+            else:
+                relation_results.append(0.0)
+            
+            # Add MeanRecall@K
+            if self.relation_mean_recalls[k]:
+                relation_results.append(np.mean(self.relation_mean_recalls[k]))
+            else:
+                relation_results.append(0.0)
+                
+        return detection_results + relation_results
+
+    def class_result(self, i):
+        """Return class-specific results for class index i."""
+        return self.box.class_result(i)  # Only detection results per class for now
+
+    @property
+    def maps(self):
+        """Returns mAP scores per class for object detection."""
+        return self.box.maps
+
+    @property
+    def fitness(self):
+        """
+        Calculate fitness score based on detection and relation metrics.
+        
+        Combines detection mAP with relation Recall@100 and MeanRecall@100.
+        """
+        # Weight for detection metrics (from DetMetrics)
+        det_fitness = self.box.fitness()
+        
+        # Weight for relation metrics (focus on Recall@100 and MeanRecall@100)
+        if self.relation_recalls[100] and self.relation_mean_recalls[100]:
+            rel_recall = np.mean(self.relation_recalls[100])
+            rel_mean_recall = np.mean(self.relation_mean_recalls[100])
+            rel_fitness = (rel_recall + rel_mean_recall) / 2
+        else:
+            rel_fitness = 0
+        
+        # Combined fitness: 50% detection, 50% relation
+        return 0.5 * det_fitness + 0.5 * rel_fitness
+
+    @property
+    def ap_class_index(self):
+        """Returns the average precision index per class for detection."""
+        return self.box.ap_class_index
+
+    @property
+    def results_dict(self):
+        """Returns dictionary of computed metrics."""
+        return dict(zip(self.keys + ["fitness"], self.mean_results() + [self.fitness]))
+
+    @property
+    def curves(self):
+        """Returns a list of metric curve names."""
+        return [
+            "Precision-Recall(B)",  # Detection PR curve
+            "F1-Confidence(B)",     # Detection F1 curve
+            "Precision-Confidence(B)",  # Detection precision curve
+            "Recall-Confidence(B)",     # Detection recall curve
+        ]  # TODO: Add relation-specific curves
+
+    @property
+    def curves_results(self):
+        """Returns curve data for plotting."""
+        return self.box.curves_results
+
+    def plot_relation_metrics(self, on_plot=None):
+        """
+        Plot relation metrics as bar charts.
+        
+        Args:
+            on_plot (callable, optional): Function to call after plotting.
+        """
+        if not self.plot:
+            return
+
+        import matplotlib.pyplot as plt
+
+        # Set up the figure
+        fig, axes = plt.subplots(2, 1, figsize=(12, 10), tight_layout=True)
+
+        # Plot Recall@K
+        x = list(self.topk)
+        y_recall = [np.mean(self.relation_recalls[k]) if self.relation_recalls[k] else 0 for k in x]
+        
+        axes[0].bar(x, y_recall, width=5, alpha=0.7)
+        axes[0].set_title('Relation Recall@K')
+        axes[0].set_xlabel('K')
+        axes[0].set_ylabel('Recall')
+        axes[0].set_xticks(x)
+        axes[0].set_ylim(0, 1)
+        for i, v in enumerate(y_recall):
+            axes[0].text(x[i], v + 0.02, f'{v:.3f}', ha='center')
+
+        # Plot MeanRecall@K
+        y_mean_recall = [np.mean(self.relation_mean_recalls[k]) if self.relation_mean_recalls[k] else 0 for k in x]
+        
+        axes[1].bar(x, y_mean_recall, width=5, alpha=0.7, color='orange')
+        axes[1].set_title('Relation MeanRecall@K')
+        axes[1].set_xlabel('K')
+        axes[1].set_ylabel('MeanRecall')
+        axes[1].set_xticks(x)
+        axes[1].set_ylim(0, 1)
+        for i, v in enumerate(y_mean_recall):
+            axes[1].text(x[i], v + 0.02, f'{v:.3f}', ha='center')
+
+        # Save figure
+        save_dir = self.save_dir / 'relation_metrics.png'
+        fig.savefig(save_dir, dpi=250)
+        plt.close(fig)
+        
+        if on_plot:
+            on_plot(save_dir)
+
+    def summary(self, normalize: bool = True, decimals: int = 5) -> List[Dict[str, Any]]:
+        """
+        Generate a summarized representation of relation detection metrics.
+        
+        Args:
+            normalize (bool): For Relation metrics, everything is normalized by default [0-1].
+            decimals (int): Number of decimal places to round the metrics values to.
+            
+        Returns:
+            (List[Dict[str, Any]]): A list of dictionaries with metric summaries.
+        """
+        # Detection summary (using box metrics)
+        detection_summary = [{
+            "Task": "Detection",
+            "Precision": round(self.box.mp, decimals),
+            "Recall": round(self.box.mr, decimals),
+            "mAP@0.5": round(self.box.map50, decimals),
+            "mAP@0.5:0.95": round(self.box.map, decimals),
+        }]
+        
+        # Relation summary
+        relation_summary = []
+        for k in self.topk:
+            recall_k = np.mean(self.relation_recalls[k]) if self.relation_recalls[k] else 0.0
+            mean_recall_k = np.mean(self.relation_mean_recalls[k]) if self.relation_mean_recalls[k] else 0.0
+            
+            relation_summary.append({
+                "Task": f"Relation@{k}",
+                f"Recall@{k}": round(recall_k, decimals),
+                f"MeanRecall@{k}": round(mean_recall_k, decimals),
+                "TotalRelations": sum(self.relation_class_counts.values()),
+                "ActiveClasses": len(self.relation_class_counts),
+            })
+        
+        # Combined fitness summary
+        fitness_summary = [{
+            "Task": "Combined",
+            "Fitness": round(self.fitness, decimals),
+            "DetectionWeight": 0.5,
+            "RelationWeight": 0.5,
+        }]
+        
+        return detection_summary + relation_summary + fitness_summary

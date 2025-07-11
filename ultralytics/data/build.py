@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 from torch.utils.data import dataloader, distributed
 
-from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
+from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset, YOLORelationDataset
 from ultralytics.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -153,6 +153,44 @@ def build_grounding(cfg, img_path, json_file, batch, mode="train", rect=False, s
         fraction=cfg.fraction if mode == "train" else 1.0,
     )
 
+
+def build_yolo_relation_dataset(cfg, img_path, batch, data, relation_file, mode="train", rect=False, stride=32):
+    """
+    Build relationship dataset for training or validation.
+    
+    Args:
+        img_path (str): Path to images
+        relation_file (str): Path to relationship annotations
+        mode (str): Dataset mode ('train' or 'val')
+        args (object, optional): Training arguments
+        **kwargs: Additional dataset arguments
+        
+    Returns:
+        RelationDataset: Configured relationship dataset
+    """
+
+    dataset = YOLORelationDataset(
+        img_path=img_path,
+        relation_file=relation_file,
+        imgsz=cfg.imgsz,
+        batch_size=batch,
+        augment=mode == "train",  # augmentation
+        hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
+        rect=cfg.rect or rect,  # rectangular batches
+        cache=cfg.cache or None,
+        single_cls=cfg.single_cls or False,
+        stride=int(stride),
+        pad=0.0 if mode == "train" else 0.5,
+        prefix=colorstr(f"{mode}: "),
+        task=cfg.task,
+        classes=cfg.classes,
+        data=data,
+        fraction=cfg.fraction if mode == "train" else 1.0,
+        negative_sampling=mode == "train",
+        max_relations_per_image=getattr(cfg, 'max_relations_per_image', 100),
+    )
+    
+    return dataset
 
 def build_dataloader(dataset, batch: int, workers: int, shuffle: bool = True, rank: int = -1, drop_last: bool = False):
     """

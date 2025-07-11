@@ -16,6 +16,7 @@ from ultralytics.nn.tasks import (
     YOLOEModel,
     YOLOESegModel,
 )
+from ultralytics.models.yolo.relation import RelationModel
 from ultralytics.utils import ROOT, YAML
 
 
@@ -25,11 +26,12 @@ class YOLO(Model):
 
     This class provides a unified interface for YOLO models, automatically switching to specialized model types
     (YOLOWorld or YOLOE) based on the model filename. It supports various computer vision tasks including object
-    detection, segmentation, classification, pose estimation, and oriented bounding box detection.
+    detection, segmentation, classification, pose estimation, oriented bounding box detection, and relationship
+    detection.
 
     Attributes:
         model: The loaded YOLO model instance.
-        task: The task type (detect, segment, classify, pose, obb).
+        task: The task type (detect, segment, classify, pose, obb, relation).
         overrides: Configuration overrides for the model.
 
     Methods:
@@ -56,7 +58,7 @@ class YOLO(Model):
 
         Args:
             model (str | Path): Model name or path to model file, i.e. 'yolo11n.pt', 'yolo11n.yaml'.
-            task (str, optional): YOLO task specification, i.e. 'detect', 'segment', 'classify', 'pose', 'obb'.
+            task (str, optional): YOLO task specification, i.e. 'detect', 'segment', 'classify', 'pose', 'obb', 'relation'.
                 Defaults to auto-detection based on model.
             verbose (bool): Display model info on load.
 
@@ -117,6 +119,12 @@ class YOLO(Model):
                 "trainer": yolo.obb.OBBTrainer,
                 "validator": yolo.obb.OBBValidator,
                 "predictor": yolo.obb.OBBPredictor,
+            },
+            "relation": {
+                "model": RelationModel,
+                "trainer": yolo.relation.RelationTrainer,
+                "validator": yolo.relation.RelationValidator,
+                "predictor": yolo.relation.RelationPredictor,
             },
         }
 
@@ -204,7 +212,7 @@ class YOLOE(Model):
 
     Attributes:
         model: The loaded YOLOE model instance.
-        task: The task type (detect or segment).
+        task: The task type (detect, segment, or relation).
         overrides: Configuration overrides for the model.
 
     Methods:
@@ -262,6 +270,12 @@ class YOLOE(Model):
                 "validator": yolo.yoloe.YOLOESegValidator,
                 "predictor": yolo.segment.SegmentationPredictor,
                 "trainer": yolo.yoloe.YOLOESegTrainer,
+            },
+            "relation": {
+                "model": RelationModel,  # Use RelationModel for relation detection
+                "trainer": yolo.relation.RelationTrainer,
+                "validator": yolo.relation.RelationValidator,
+                "predictor": yolo.relation.RelationPredictor,
             },
         }
 

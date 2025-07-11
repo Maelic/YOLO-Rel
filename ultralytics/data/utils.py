@@ -294,6 +294,160 @@ def visualize_image_annotations(image_path: str, txt_path: str, label_map: Dict[
     ax.imshow(img)
     plt.show()
 
+def visualize_image_rel_annotations(
+    image_path: str, 
+    txt_path: str, 
+    relations_json: str, 
+    label_map: Dict[int, str],
+    rel_label_map: Dict[int, str] = None
+):
+    """
+    Visualize YOLO annotations with relationships on an image.
+
+    This function reads an image, its corresponding annotation file in YOLO format, and relationship 
+    annotations from a JSON file. It draws bounding boxes around detected objects, labels them with 
+    their respective class names, and draws lines between related objects with relationship labels.
+
+    Args:
+        image_path (str): The path to the image file to annotate.
+        txt_path (str): The path to the annotation file in YOLO format.
+        relations_json (str): The path to the relations JSON file containing relationship annotations.
+        label_map (Dict[int, str]): A dictionary that maps class IDs to class labels.
+        rel_label_map (Dict[int, str], optional): A dictionary that maps relation IDs to relation labels.
+
+    Examples:
+        >>> label_map = {0: "cat", 1: "dog", 2: "bird"}
+        >>> rel_map = {0: "on", 1: "beside", 2: "holding"}
+        >>> visualize_image_rel_annotations("image.jpg", "labels.txt", "relations.json", label_map, rel_map)
+    """
+    import json
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    from ultralytics.utils.plotting import colors
+
+    # Load image
+    img = np.array(Image.open(image_path))
+    img_height, img_width = img.shape[:2]
+    
+    # Load bounding box annotations
+    annotations = []
+    if Path(txt_path).exists():
+        with open(txt_path, encoding="utf-8") as file:
+            for line in file:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    class_id, x_center, y_center, width, height = map(float, parts)
+                    x = (x_center - width / 2) * img_width
+                    y = (y_center - height / 2) * img_height
+                    w = width * img_width
+                    h = height * img_height
+                    annotations.append({
+                        'x': x, 'y': y, 'w': w, 'h': h, 
+                        'class_id': int(class_id),
+                        'center_x': x_center * img_width,
+                        'center_y': y_center * img_height
+                    })
+    
+    # Load relationship annotations
+    relations = []
+    if Path(relations_json).exists():
+        try:
+            with open(relations_json, 'r') as f:
+                relations_data = json.load(f)
+            
+            # Get image filename from path
+            image_name = Path(image_path).name
+            
+            # Find relations for this image
+            if image_name in relations_data:
+                relations = relations_data[image_name]
+            else:
+                # Try without extension or with different naming
+                image_stem = Path(image_path).stem
+                for key in relations_data.keys():
+                    if Path(key).stem == image_stem or key == image_stem:
+                        relations = relations_data[key]
+                        break
+        except Exception as e:
+            print(f"Warning: Could not load relations from {relations_json}: {e}")
+    
+    # Create plot
+    fig, ax = plt.subplots(1, figsize=(12, 8))
+    
+    # Draw bounding boxes
+    for i, ann in enumerate(annotations):
+        color = tuple(c / 255 for c in colors(ann['class_id'], True))
+        
+        # Draw bounding box
+        rect = plt.Rectangle(
+            (ann['x'], ann['y']), ann['w'], ann['h'], 
+            linewidth=2, edgecolor=color, facecolor="none"
+        )
+        ax.add_patch(rect)
+        
+        # Add class label
+        luminance = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+        class_name = label_map.get(ann['class_id'], f"class_{ann['class_id']}")
+        ax.text(
+            ann['x'], ann['y'] - 5, 
+            f"{i}: {class_name}", 
+            color="white" if luminance < 0.5 else "black", 
+            backgroundcolor=color,
+            fontsize=8
+        )
+    
+    # Draw relationships
+    relation_color = (1.0, 0.0, 1.0)  # Magenta for all relations
+    for relation in relations:
+        if len(relation) >= 3:
+            subj_idx, obj_idx, rel_class = relation[0], relation[1], relation[2]
+            
+            # Check if both objects exist in annotations
+            if subj_idx < len(annotations) and obj_idx < len(annotations):
+                subj_ann = annotations[subj_idx]
+                obj_ann = annotations[obj_idx]
+                
+                # Draw line between object centers
+                ax.plot(
+                    [subj_ann['center_x'], obj_ann['center_x']], 
+                    [subj_ann['center_y'], obj_ann['center_y']], 
+                    color=relation_color, linewidth=2, alpha=0.7
+                )
+                
+                # Add relationship label at midpoint
+                mid_x = (subj_ann['center_x'] + obj_ann['center_x']) / 2
+                mid_y = (subj_ann['center_y'] + obj_ann['center_y']) / 2
+                
+                # Get relation name
+                if rel_label_map:
+                    rel_name = rel_label_map.get(rel_class, f"rel_{rel_class}")
+                else:
+                    rel_name = str(rel_class)
+                
+                ax.text(
+                    mid_x, mid_y, rel_name,
+                    color='white', backgroundcolor=relation_color,
+                    fontsize=7, ha='center', va='center',
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor=relation_color, alpha=0.8)
+                )
+    
+    # Setup plot
+    ax.imshow(img)
+    ax.set_title(f"Image: {Path(image_path).name} | Objects: {len(annotations)} | Relations: {len(relations)}")
+    ax.axis('off')
+    
+    # Add text annotations for legend
+    ax.text(0.02, 0.98, 'Legend:', transform=ax.transAxes, fontsize=10, fontweight='bold',
+            verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+    ax.text(0.02, 0.93, '■ Bounding Boxes (colored by class)', transform=ax.transAxes, fontsize=8,
+            verticalalignment='top', bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
+    ax.text(0.02, 0.88, '— Relations (magenta lines)', transform=ax.transAxes, fontsize=8, color=relation_color,
+            verticalalignment='top', bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.show()
+
 
 def polygon2mask(
     imgsz: Tuple[int, int], polygons: List[np.ndarray], color: int = 1, downsample_ratio: int = 1

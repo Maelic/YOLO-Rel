@@ -1,0 +1,204 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: /home/maelicneau/Documents/DATASETS/PSG_split/YOLO_anno # dataset root dir
+train: ./train/ # train images (relative to 'path') 118287 images
+val: ./val/ # val images (relative to 'path') 5000 images
+test: ./val/ # 20288 of 40670 images, submit to https://competitions.codalab.org/competitions/20794
+
+relation_train: ./train/relations.json
+relation_test: ./test/relations.json
+relation_val: ./val/relations.json
+
+# Classes
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: airplane
+  5: bus
+  6: train
+  7: truck
+  8: boat
+  9: traffic light
+  10: fire hydrant
+  11: stop sign
+  12: parking meter
+  13: bench
+  14: bird
+  15: cat
+  16: dog
+  17: horse
+  18: sheep
+  19: cow
+  20: elephant
+  21: bear
+  22: zebra
+  23: giraffe
+  24: backpack
+  25: umbrella
+  26: handbag
+  27: tie
+  28: suitcase
+  29: frisbee
+  30: skis
+  31: snowboard
+  32: sports ball
+  33: kite
+  34: baseball bat
+  35: baseball glove
+  36: skateboard
+  37: surfboard
+  38: tennis racket
+  39: bottle
+  40: wine glass
+  41: cup
+  42: fork
+  43: knife
+  44: spoon
+  45: bowl
+  46: banana
+  47: apple
+  48: sandwich
+  49: orange
+  50: broccoli
+  51: carrot
+  52: hot dog
+  53: pizza
+  54: donut
+  55: cake
+  56: chair
+  57: couch
+  58: potted plant
+  59: bed
+  60: dining table
+  61: toilet
+  62: tv
+  63: laptop
+  64: mouse
+  65: remote
+  66: keyboard
+  67: cell phone
+  68: microwave
+  69: oven
+  70: toaster
+  71: sink
+  72: refrigerator
+  73: book
+  74: clock
+  75: vase
+  76: scissors
+  77: teddy bear
+  78: hair drier
+  79: toothbrush
+  80: banner
+  81: blanket
+  82: bridge
+  83: cardboard
+  84: counter
+  85: curtain
+  86: door-stuff
+  87: floor-wood
+  88: flower
+  89: fruit
+  90: gravel
+  91: house
+  92: light
+  93: mirror-stuff
+  94: net
+  95: pillow
+  96: platform
+  97: playingfield
+  98: railroad
+  99: river
+  100: road
+  101: roof
+  102: sand
+  103: sea
+  104: shelf
+  105: snow
+  106: stairs
+  107: tent
+  108: towel
+  109: wall-brick
+  110: wall-stone
+  111: wall-tile
+  112: wall-wood
+  113: water-other
+  114: window-blind
+  115: window-other
+  116: tree-merged
+  117: fence-merged
+  118: ceiling-merged
+  119: sky-other-merged
+  120: cabinet-merged
+  121: table-merged
+  122: floor-other-merged
+  123: pavement-merged
+  124: mountain-merged
+  125: grass-merged
+  126: dirt-merged
+  127: paper-merged
+  128: food-other-merged
+  129: building-other-merged
+  130: rock-merged
+  131: wall-other-merged
+  132: rug-merged
+
+# Relations classes
+rel_names:
+  0: over
+  1: in front of
+  2: beside
+  3: "on" # Note: "on" is a reserved keyword in Python, so we use quotes to avoid syntax errors with yaml.safe_load
+  4: in
+  5: attached to
+  6: hanging from
+  7: on back of
+  8: falling off
+  9: going down
+  10: painted on
+  11: walking on
+  12: running on
+  13: crossing
+  14: standing on
+  15: lying on
+  16: sitting on
+  17: flying over
+  18: jumping over
+  19: jumping from
+  20: wearing
+  21: holding
+  22: carrying
+  23: looking at
+  24: guiding
+  25: kissing
+  26: eating
+  27: drinking
+  28: feeding
+  29: biting
+  30: catching
+  31: picking
+  32: playing with
+  33: chasing
+  34: climbing
+  35: cleaning
+  36: playing
+  37: touching
+  38: pushing
+  39: pulling
+  40: opening
+  41: cooking
+  42: talking to
+  43: throwing
+  44: slicing
+  45: driving
+  46: riding
+  47: parked on
+  48: driving on
+  49: about to hit
+  50: kicking
+  51: swinging
+  52: entering
+  53: exiting
+  54: enclosing
+  55: leaning on

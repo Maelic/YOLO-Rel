@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import json
+import os
 from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -854,3 +855,441 @@ class ClassificationDataset:
             x["msgs"] = msgs  # warnings
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
             return samples
+
+class YOLORelationDataset(YOLODataset):
+    """
+    Enhanced YOLO dataset with comprehensive support for relationship annotations between objects.
+    
+    This dataset extends YOLODataset to support relationship detection training with features:
+    - Relationship class mapping and vocabulary
+    - Negative sampling for relationship pairs
+    - Support for hierarchical relationship classes
+    - Integration with open-vocabulary text embeddings
+    - Proper handling of object-relationship consistency during augmentation
+    - Dataset statistics and class balancing utilities
+    
+    Attributes:
+        relationships (dict): Mapping from image paths to relationship annotations
+        relation_file (str): Path to relationship annotations JSON file
+        relation_vocab (dict): Mapping from relation names to class IDs
+        num_relation_classes (int): Number of relationship classes
+        negative_sampling (bool): Whether to generate negative relationship samples
+        max_relations_per_image (int): Maximum number of relations per image
+        relation_stats (dict): Dataset statistics for relationship classes
+        
+    Examples:
+        >>> dataset = YOLORelationDataset(
+        ...     img_path="path/to/images",
+        ...     data={"names": {0: "person", 1: "car"}, "nc": 2, "rel_names": {0: "on", 1: "in"}, "nr": 2},
+        ...     task="relation",
+        ...     relation_file="path/to/relations.json"
+        ... )
+        >>> sample = dataset[0]  # Get sample with relationships
+        >>> print(sample.keys())  # Should include 'relations', 'relation_labels', etc.
+    """
+    
+    def __init__(
+        self,
+        *args,
+        relation_file: Optional[str] = None,
+        task: str = "relation",
+        negative_sampling: bool = True,
+        max_relations_per_image: int = 100,
+        **kwargs
+    ):
+        """
+        Initialize YOLORelationDataset with relationship support.
+        
+        Args:
+            relation_file (str, optional): Path to relationship annotations JSON file
+            relation_vocab (Dict[str, int], optional): Mapping from relation names to IDs
+            negative_sampling (bool): Whether to generate negative relationship samples
+            max_relations_per_image (int): Maximum number of relations per image
+            *args: Additional positional arguments for parent class
+            **kwargs: Additional keyword arguments for parent class
+        """
+        assert task == "relation", "YOLORelationDataset only supports 'relation' task"
+        super().__init__(*args, **kwargs)
+
+        self.relation_file = relation_file
+        self.negative_sampling = negative_sampling
+        self.max_relations_per_image = max_relations_per_image
+        self.relationships = {}  # Mapping from image path to relationship annotations
+        
+        # Initialize relation vocabulary from data config
+        self.relation_vocab = {}
+        self.id_to_relation = {}
+        self._num_relation_classes = 0
+        
+        if self.data and 'rel_names' in self.data:
+            self.relation_vocab = {v: k for k, v in self.data['rel_names'].items()}
+            self.id_to_relation = self.data['rel_names']
+            self._num_relation_classes = len(self.data['rel_names'])
+        else:
+            LOGGER.warning("No relation vocabulary found in data config")
+        
+        # Load relationship annotations
+        if relation_file:
+            self._load_relations()
+        
+        # Initialize statistics
+        self.relation_stats = {}
+        if self.relationships:
+            self._compute_dataset_stats()
+        
+        LOGGER.info(f"YOLORelationDataset initialized with {self.num_relation_classes} relation classes")
+
+    def _load_relations(self):
+        """Load relationship annotations from a JSON file."""
+        if not self.relation_file or not os.path.exists(self.relation_file):
+            LOGGER.warning(f"Relation file {self.relation_file} not found.")
+            return
+
+        try:
+            with open(self.relation_file, 'r') as f:
+                relations_data = json.load(f)
+            
+            # Map relations to full image paths
+            loaded_count = 0
+            images_with_relations = 0
+            
+            for img_path in self.im_files:
+                img_name = Path(img_path).name.split('.jpg')[0]  # Get just the filename
+                if img_name in relations_data:
+                    # Convert to numpy array
+                    relations = np.array(relations_data[img_name], dtype=int)
+                    self.relationships[img_path] = relations
+                    loaded_count += len(relations)
+                    if len(relations) > 0:
+                        images_with_relations += 1
+                else:
+                    self.relationships[img_path] = np.zeros((0, 3), dtype=int)
+                    
+            LOGGER.info(f"Loaded {loaded_count} relations for {images_with_relations}/{len(self.im_files)} images")
+        
+        except Exception as e:
+            LOGGER.error(f"Failed to load relation file: {e}")
+            # Initialize with empty relations
+            for img_path in self.im_files:
+                self.relationships[img_path] = np.zeros((0, 3), dtype=int)
+
+    def _compute_dataset_stats(self):
+        """Compute dataset statistics for relationship classes."""
+        relation_counts = {}
+        total_relations = 0
+        images_with_relations = 0
+        
+        for img_path, relations in self.relationships.items():
+            if len(relations) > 0:
+                images_with_relations += 1
+                
+            for _, _, rel_class in relations:
+                if rel_class in self.id_to_relation:
+                    rel_name = self.id_to_relation[rel_class]
+                    relation_counts[rel_name] = relation_counts.get(rel_name, 0) + 1
+                    total_relations += 1
+        
+        self.relation_stats = {
+            "total_relations": total_relations,
+            "images_with_relations": images_with_relations,
+            "relation_counts": relation_counts,
+            "average_relations_per_image": total_relations / len(self.im_files) if self.im_files else 0,
+            "average_relations_per_image_with_relations": total_relations / images_with_relations if images_with_relations > 0 else 0
+        }
+        
+        LOGGER.info(f"Relation stats: {total_relations} total relations, "
+                   f"{self.relation_stats['average_relations_per_image']:.2f} avg per image")
+
+    def generate_negative_samples(self, positive_relations: torch.Tensor, num_objects: int) -> torch.Tensor:
+        """
+        Generate negative relationship samples for balanced training.
+        
+        Args:
+            positive_relations (torch.Tensor): Positive relations [N, 3] (subj, obj, rel)
+            num_objects (int): Number of objects in the image
+            
+        Returns:
+            torch.Tensor: Negative relations [M, 3] where M is number of negative samples
+        """
+        if num_objects < 2:
+            return torch.zeros((0, 3), dtype=torch.long)
+        
+        # Create set of positive pairs
+        positive_pairs = set()
+        for subj, obj, rel in positive_relations:
+            positive_pairs.add((subj.item(), obj.item()))
+        
+        # Generate all possible pairs
+        all_pairs = []
+        for i in range(num_objects):
+            for j in range(num_objects):
+                if i != j and (i, j) not in positive_pairs:
+                    all_pairs.append((i, j))
+        
+        # Sample negative pairs (up to same number as positive relations)
+        num_negatives = min(len(all_pairs), len(positive_relations) * 2)
+        if num_negatives > 0:
+            negative_indices = torch.randperm(len(all_pairs))[:num_negatives]
+            negative_pairs = [all_pairs[i] for i in negative_indices]
+            
+            # Assign background class (assuming last class is background)
+            background_class = self.relation_vocab.get("background", self.num_relation_classes - 1)
+            negative_relations = torch.tensor([
+                [subj, obj, background_class] for subj, obj in negative_pairs
+            ], dtype=torch.long)
+            
+            return negative_relations
+        
+        return torch.zeros((0, 3), dtype=torch.long)
+
+    def filter_relations_by_objects(self, relations: np.ndarray, valid_objects: np.ndarray) -> np.ndarray:
+        """
+        Filter relations to only include those between valid objects after augmentation.
+        
+        Args:
+            relations (np.ndarray): Relations [N, 3] (subj, obj, rel)
+            valid_objects (np.ndarray): Valid object indices after augmentation
+            
+        Returns:
+            np.ndarray: Filtered relations with updated indices
+        """
+        if len(relations) == 0 or len(valid_objects) == 0:
+            return np.zeros((0, 3), dtype=int)
+        
+        # Create mapping from old indices to new indices
+        old_to_new = {}
+        for new_idx, old_idx in enumerate(valid_objects):
+            old_to_new[old_idx] = new_idx
+        
+        # Filter and remap relations
+        valid_relations = []
+        for subj, obj, rel in relations:
+            if subj in old_to_new and obj in old_to_new:
+                valid_relations.append([old_to_new[subj], old_to_new[obj], rel])
+        
+        return np.array(valid_relations, dtype=int) if valid_relations else np.zeros((0, 3), dtype=int)
+
+    def create_relation_targets(self, relations: torch.Tensor, num_objects: int) -> Dict[str, torch.Tensor]:
+        """
+        Create relationship targets for training.
+        
+        Args:
+            relations (torch.Tensor): Relations [N, 3] (subj, obj, rel)
+            num_objects (int): Number of objects in the image
+            
+        Returns:
+            Dict[str, torch.Tensor]: Relationship targets and metadata
+        """
+        if num_objects < 2:
+            return {
+                "relation_labels": torch.zeros((0,), dtype=torch.long),
+                "object_pairs": torch.zeros((0, 2), dtype=torch.long),
+                "num_relations": 0
+            }
+        
+        # Add negative samples if enabled
+        if self.negative_sampling:
+            negative_relations = self.generate_negative_samples(relations, num_objects)
+            all_relations = torch.cat([relations, negative_relations]) if len(relations) > 0 else negative_relations
+        else:
+            all_relations = relations
+        
+        # Limit number of relations per image
+        if len(all_relations) > self.max_relations_per_image:
+            indices = torch.randperm(len(all_relations))[:self.max_relations_per_image]
+            all_relations = all_relations[indices]
+        
+        # Extract components
+        object_pairs = all_relations[:, :2]  # [N, 2]
+        relation_labels = all_relations[:, 2]  # [N]
+        
+        return {
+            "relation_labels": relation_labels,
+            "object_pairs": object_pairs,
+            "num_relations": len(all_relations)
+        }
+
+    def _map_augmented_index(self, old_idx):
+        """Map an object index from before augmentation to after augmentation."""
+        if not hasattr(self, 'last_indices_mapping'):
+            return None
+        return self.last_indices_mapping.get(old_idx, None)
+
+    def __getitem__(self, index: int) -> Dict:
+        """
+        Get training sample with relationship annotations.
+        
+        Args:
+            index (int): Sample index
+            
+        Returns:
+            Dict: Training sample with image, labels, and relationship data
+        """
+        # Get base sample from parent class
+        result = super().__getitem__(index)
+            
+        # Get image path and corresponding relations
+        img_path = self.im_files[index]
+        relations = self.relationships.get(img_path, np.zeros((0, 3), dtype=int)).copy()
+        
+        # Convert to tensor immediately
+        relations = torch.from_numpy(relations).long()
+        
+        # Handle augmentation transforms for relationships
+        if self.augment and len(relations) > 0 and hasattr(self, 'last_indices_mapping'):
+            # When objects are removed or reordered during augmentation,
+            # we need to update the relation indices accordingly
+            valid_relations = []
+            for subj_idx, obj_idx, rel_class in relations:
+                # Map old indices to new ones using the transformation record
+                new_subj_idx = self._map_augmented_index(subj_idx.item())
+                new_obj_idx = self._map_augmented_index(obj_idx.item())
+                # Only keep relations where both objects are still present
+                if new_subj_idx is not None and new_obj_idx is not None:
+                    valid_relations.append([new_subj_idx, new_obj_idx, rel_class.item()])
+            
+            # Update relations with valid ones only
+            relations = torch.tensor(valid_relations, dtype=torch.long) if valid_relations else torch.zeros((0, 3), dtype=torch.long)
+        
+        # Extract object information for relationship target creation
+        if hasattr(result, 'instances') and result.instances is not None:
+            num_objects = len(result.instances)
+        elif 'cls' in result and result['cls'] is not None:
+            num_objects = len(result['cls'])
+        else:
+            num_objects = 0
+        
+        # Create relationship targets
+        relation_targets = self.create_relation_targets(relations, num_objects)
+        
+        # Update result with relationship data
+        result.update({
+            'relations': relations,
+            'relation_labels': relation_targets["relation_labels"],
+            'object_pairs': relation_targets["object_pairs"],
+            'num_relations': relation_targets["num_relations"],
+            'num_objects': num_objects
+        })
+        
+        return result
+
+    def get_relation_weights(self) -> np.ndarray:
+        """
+        Get class weights for relationship classes based on dataset statistics.
+        
+        Returns:
+            np.ndarray: Class weights for balanced training
+        """
+        if not self.relation_stats.get("relation_counts"):
+            return np.ones(self.num_relation_classes)
+        
+        # Calculate inverse frequency weights
+        total_relations = self.relation_stats["total_relations"]
+        weights = np.ones(self.num_relation_classes)
+        
+        for rel_name, count in self.relation_stats["relation_counts"].items():
+            if rel_name in self.relation_vocab:
+                rel_id = self.relation_vocab[rel_name]
+                weights[rel_id] = total_relations / (count * self.num_relation_classes)
+        
+        return weights
+
+    def export_relation_annotations(self, output_path: str):
+        """
+        Export relationship annotations to JSON file.
+        
+        Args:
+            output_path (str): Path to output JSON file
+        """
+        annotations = {}
+        
+        for img_path, relations in self.relationships.items():
+            img_name = Path(img_path).stem
+            
+            # Convert to list of dictionaries with relation names
+            relation_list = []
+            for subj, obj, rel_class in relations:
+                relation_list.append({
+                    "subject": int(subj),
+                    "object": int(obj),
+                    "relation": self.id_to_relation.get(rel_class, f"unknown_{rel_class}")
+                })
+            
+            annotations[img_name] = relation_list
+        
+        with open(output_path, 'w') as f:
+            json.dump(annotations, f, indent=2)
+        
+        LOGGER.info(f"Exported relationship annotations to {output_path}")
+
+    @staticmethod
+    def collate_fn(batch: List[Dict]) -> Dict:
+        """
+        Collate data samples into batches with relationship data.
+        
+        Args:
+            batch (List[dict]): List of dictionaries containing sample data
+            
+        Returns:
+            Dict: Collated batch with stacked tensors including relationship data
+        """
+        # Use parent class collate function for standard data
+        new_batch = YOLODataset.collate_fn(batch)
+        
+        # Handle relationship-specific data
+        if 'relations' in batch[0]:
+            relations = [b['relations'] for b in batch]
+            new_batch['relations'] = relations
+        
+        if 'relation_labels' in batch[0]:
+            relation_labels = [b['relation_labels'] for b in batch]
+            # Pad and concatenate relation labels
+            max_relations = max(len(labels) for labels in relation_labels) if relation_labels else 0
+            if max_relations > 0:
+                padded_labels = []
+                for labels in relation_labels:
+                    if len(labels) < max_relations:
+                        # Pad with background class
+                        padding = np.full(max_relations - len(labels), -1, dtype=int)
+                        padded_labels.append(np.concatenate([labels, padding]))
+                    else:
+                        padded_labels.append(labels[:max_relations])
+                new_batch['relation_labels'] = torch.from_numpy(np.array(padded_labels))
+            else:
+                new_batch['relation_labels'] = torch.empty(0, dtype=torch.long)
+        
+        if 'object_pairs' in batch[0]:
+            if max_relations > 0:
+                object_pairs = [b['object_pairs'] for b in batch]
+                # Pad and concatenate object pairs
+                max_pairs = max(len(pairs) for pairs in object_pairs) if object_pairs else 0
+                padded_pairs = []
+                for pairs in object_pairs:
+                    if len(pairs) < max_pairs:
+                        padding = np.full((max_pairs - len(pairs), 2), -1, dtype=int)
+                        padded_pairs.append(np.concatenate([pairs, padding], axis=0))
+                    else:
+                        padded_pairs.append(pairs[:max_pairs])
+                new_batch['object_pairs'] = torch.from_numpy(np.array(padded_pairs))
+            else:
+                new_batch['object_pairs'] = torch.empty((0, 2), dtype=torch.long)
+        
+        if 'num_relations' in batch[0]:
+            num_relations = [b['num_relations'] for b in batch]
+            new_batch['num_relations'] = torch.tensor(num_relations)
+        
+        if 'num_objects' in batch[0]:
+            num_objects = [b['num_objects'] for b in batch]
+            new_batch['num_objects'] = torch.tensor(num_objects)
+        
+        return new_batch
+
+    @property
+    def num_relation_classes(self):
+        """Return the number of relation classes."""
+        return getattr(self, '_num_relation_classes', len(self.id_to_relation) if hasattr(self, 'id_to_relation') else 0)
+    
+    @num_relation_classes.setter
+    def num_relation_classes(self, value):
+        """Set the number of relation classes."""
+        self._num_relation_classes = value
