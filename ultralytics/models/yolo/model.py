@@ -11,12 +11,12 @@ from ultralytics.nn.tasks import (
     DetectionModel,
     OBBModel,
     PoseModel,
+    RelationModel,
     SegmentationModel,
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
 )
-from ultralytics.models.yolo.relation import RelationModel
 from ultralytics.utils import ROOT, YAML
 
 

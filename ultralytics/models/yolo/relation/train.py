@@ -2,13 +2,13 @@
 
 """
 Relationship Detection Training Pipeline.
+
 This module implements the trainer for relationship detection models.
 """
 
 from copy import copy
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Dict, List, Optional, Any
 
 from ultralytics.data import build_yolo_relation_dataset
@@ -16,8 +16,7 @@ from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.torch_utils import de_parallel
 from ultralytics.models import yolo
-
-from .model import RelationModel
+from ultralytics.nn.tasks import RelationModel
 
 
 class RelationTrainer(DetectionTrainer):
@@ -46,7 +45,7 @@ class RelationTrainer(DetectionTrainer):
         custom_relation_args = {}
         if overrides:
             relation_keys = [
-                'relation_loss_weight', 'max_relations_per_image', 'relation_classes',
+                'max_relations_per_image', 'relation_classes',
                 'relation_file_train', 'relation_file_val', 'relation_file_test'
             ]
             # Extract custom args
@@ -58,8 +57,6 @@ class RelationTrainer(DetectionTrainer):
         super().__init__(cfg, overrides, _callbacks)
         
         # Set relationship-specific parameters
-        self.relation_loss_weight = custom_relation_args.get('relation_loss_weight', 
-                                                           getattr(self.args, 'relation_loss_weight', 1.0))
         self.max_relations_per_image = custom_relation_args.get('max_relations_per_image', 
                                                               getattr(self.args, 'max_relations_per_image', 100))
         self.relation_classes = custom_relation_args.get('relation_classes', 
@@ -94,12 +91,15 @@ class RelationTrainer(DetectionTrainer):
         
         # First, try to get from dataset configuration
         if hasattr(self, 'data') and self.data:
-            if mode == "train" and f"relation_{mode}" in self.data:
-                relation_file = self.data[f"relation_{mode}"]
-            elif mode == "val" and f"relation_{mode}" in self.data:
-                relation_file = self.data[f"relation_{mode}"]
-            elif mode == "test" and f"relation_{mode}" in self.data:
-                relation_file = self.data[f"relation_{mode}"]
+            # Try new format: relation_file_train, relation_file_val
+            relation_key = f"relation_file_{mode}"
+            if relation_key in self.data:
+                relation_file = self.data[relation_key]
+            else:
+                # Fall back to old format: relation_train, relation_val
+                relation_key = f"relation_{mode}"
+                if relation_key in self.data:
+                    relation_file = self.data[relation_key]
         
         # Fall back to trainer-specific relation file arguments
         if not relation_file:
@@ -174,7 +174,16 @@ class RelationTrainer(DetectionTrainer):
         )
         
         if weights:
-            model.load(weights)
+            # Check if weights are from a detection model (like yolo11n.pt)
+            if str(weights).endswith('.pt') and not 'rel' in str(weights).lower():
+                # Use our custom detection weight transfer
+                LOGGER.info(f"Loading detection weights from {weights} using custom transfer")
+                stats = model.load_detection_weights(weights, verbose=verbose)
+                if verbose:
+                    LOGGER.info(f"Transferred {stats['total_loaded']} weights from detection model")
+            else:
+                # Standard weight loading for relation model weights
+                model.load(weights)
         
         return model
     
@@ -191,127 +200,13 @@ class RelationTrainer(DetectionTrainer):
         # Standard preprocessing
         batch = super().preprocess_batch(batch)
         
-        # Store batch for later use in model override
-        self._current_batch = batch
-        
-        # Move relationship data to device
+        # Move relationship data to device if present
         if "relation_labels" in batch:
             batch["relation_labels"] = batch["relation_labels"].to(self.device, non_blocking=True)
         if "object_pairs" in batch:
             batch["object_pairs"] = batch["object_pairs"].to(self.device, non_blocking=True)
         
         return batch
-    
-    def compute_relation_loss(self, predictions: Dict, batch: Dict) -> torch.Tensor:
-        """
-        Compute relationship prediction loss.
-        
-        Args:
-            predictions (Dict): Model predictions
-            batch (Dict): Training batch
-            
-        Returns:
-            torch.Tensor: Relationship loss
-        """
-        # This method is kept for backward compatibility, but the actual loss computation
-        # is now handled by RelationLoss in utils.loss
-        if "relation_logits" not in predictions or "relation_labels" not in batch:
-            return torch.tensor(0.0, device=self.device)
-        
-        relation_logits = predictions["relation_logits"]  # [B, M, num_relations]
-        relation_labels = batch["relation_labels"]  # [B, M]
-        
-        # Flatten for loss computation
-        relation_logits_flat = relation_logits.view(-1, relation_logits.size(-1))
-        relation_labels_flat = relation_labels.view(-1)
-        
-        # Mask out padded entries (assuming -1 or num_relations is padding)
-        valid_mask = (relation_labels_flat >= 0) & (relation_labels_flat < relation_logits.size(-1))
-        
-        if valid_mask.sum() == 0:
-            return torch.tensor(0.0, device=self.device)
-        
-        # Compute cross-entropy loss
-        relation_loss = F.cross_entropy(
-            relation_logits_flat[valid_mask],
-            relation_labels_flat[valid_mask],
-            reduction='mean'
-        )
-        
-        return relation_loss
-    
-    def loss(self, batch: Dict, preds=None) -> Dict[str, torch.Tensor]:
-        """
-        Compute total loss including detection and relationship losses.
-        
-        Args:
-            batch (Dict): Training batch
-            preds: Model predictions
-            
-        Returns:
-            Dict[str, torch.Tensor]: Loss components
-        """
-        # If preds is None, call the model with targets to compute loss internally
-        if preds is None and self.model.training:
-            # Call the model with targets to compute loss internally
-            loss_tuple = self.model(batch["img"], targets=batch)
-            
-            if isinstance(loss_tuple, tuple) and len(loss_tuple) == 2:
-                total_loss, loss_items = loss_tuple
-                
-                # Parse loss items: [box_loss, cls_loss, dfl_loss, rel_loss]
-                if len(loss_items) >= 4:
-                    loss_dict = {
-                        "box_loss": loss_items[0],
-                        "cls_loss": loss_items[1], 
-                        "dfl_loss": loss_items[2],
-                        "rel_loss": loss_items[3],
-                        "loss": total_loss.sum() if hasattr(total_loss, 'sum') else total_loss
-                    }
-                    
-                    # Set loss_items for the trainer to use
-                    self.loss_items = loss_items.detach()
-                    
-                    return loss_dict
-        
-        # Get model predictions
-        if preds is None:
-            preds = self.model(batch["img"])
-        
-        # Extract detection predictions (standard YOLO format)
-        det_preds = preds if not isinstance(preds, dict) else preds.get("detection", preds)
-        
-        # Compute detection loss using parent method
-        det_loss_dict = super().loss(batch, det_preds)
-        
-        # Compute relationship loss if available
-        relation_loss = torch.tensor(0.0, device=self.device)
-        if isinstance(preds, dict) and "relation_logits" in preds:
-            relation_loss = self.compute_relation_loss(preds, batch)
-        
-        # Combine losses
-        total_loss = det_loss_dict["loss"] + self.relation_loss_weight * relation_loss
-        
-        # Create loss_items tensor in the same order as loss_names
-        # loss_names = ("box_loss", "cls_loss", "dfl_loss", "rel_loss")
-        loss_items = torch.stack([
-            det_loss_dict.get("box_loss", torch.tensor(0.0, device=self.device)),
-            det_loss_dict.get("cls_loss", torch.tensor(0.0, device=self.device)), 
-            det_loss_dict.get("dfl_loss", torch.tensor(0.0, device=self.device)),
-            relation_loss
-        ])
-        
-        # Set loss_items for the trainer to use
-        self.loss_items = loss_items.detach()
-        
-        # Update loss dictionary
-        loss_dict = {
-            **det_loss_dict,
-            "rel_loss": relation_loss,
-            "loss": total_loss
-        }
-        
-        return loss_dict
     
     def get_validator(self):
         """Return a RelationValidator for YOLO model validation."""
@@ -351,104 +246,6 @@ class RelationTrainer(DetectionTrainer):
         # Set relationship-specific attributes
         if hasattr(self.model, 'relation_classes'):
             LOGGER.info(f"Model initialized with {len(self.model.relation_classes)} relationship classes")
-    
-    def setup_model(self):
-        """Setup model with criterion for training."""
-        super().setup_model()
-        
-        # Set the criterion on the model for direct loss computation
-        if hasattr(self, 'criterion'):
-            self.model.criterion = self.criterion
-            
-        # Set a flag to enable loss computation in model forward
-        self.model.compute_loss_for_training = True
-    
-    def _setup_train(self, world_size):
-        """
-        Setup training with proper model configuration.
-        """
-        # Call parent setup
-        super()._setup_train(world_size)
-        
-        # Set the criterion on the model for direct loss computation
-        if hasattr(self, 'criterion'):
-            self.model.criterion = self.criterion
-            
-        # Set a flag to enable loss computation in model forward
-        self.model.compute_loss_for_training = True
-    
-    def loss(self, batch: Dict, preds=None) -> Dict[str, torch.Tensor]:
-        """
-        Compute total loss including detection and relationship losses.
-        
-        Args:
-            batch (Dict): Training batch
-            preds: Model predictions (if None, will call model with targets)
-            
-        Returns:
-            Dict[str, torch.Tensor]: Loss components
-        """
-        # If preds is None, call the model with targets to get both predictions and loss
-        if preds is None and self.model.training:
-            # Call the model with targets to compute loss internally
-            loss_tuple = self.model(batch["img"], targets=batch)
-            
-            if isinstance(loss_tuple, tuple) and len(loss_tuple) == 2:
-                total_loss, loss_items = loss_tuple
-                
-                # Parse loss items: [box_loss, cls_loss, dfl_loss, rel_loss]
-                if len(loss_items) >= 4:
-                    loss_dict = {
-                        "box_loss": loss_items[0],
-                        "cls_loss": loss_items[1], 
-                        "dfl_loss": loss_items[2],
-                        "rel_loss": loss_items[3],
-                        "loss": total_loss.sum() if hasattr(total_loss, 'sum') else total_loss
-                    }
-                    
-                    # Set loss_items for the trainer to use
-                    self.loss_items = loss_items.detach()
-                    
-                    return loss_dict
-        
-        # Fall back to standard detection loss computation
-        if preds is None:
-            preds = self.model(batch["img"])
-        
-        # Extract detection predictions (standard YOLO format)
-        det_preds = preds if not isinstance(preds, dict) else preds.get("detection", preds)
-        
-        # Compute detection loss using parent method
-        det_loss_dict = super().loss(batch, det_preds)
-        
-        # Compute relationship loss if available
-        relation_loss = torch.tensor(0.0, device=self.device)
-        if isinstance(preds, dict) and "relation_logits" in preds:
-            relation_loss = self.compute_relation_loss(preds, batch)
-        
-        # Combine losses
-        total_loss = det_loss_dict["loss"] + self.relation_loss_weight * relation_loss
-        
-        # Create loss_items tensor in the same order as loss_names
-        # loss_names = ("box_loss", "cls_loss", "dfl_loss", "rel_loss")
-        loss_items = torch.stack([
-            det_loss_dict.get("box_loss", torch.tensor(0.0, device=self.device)),
-            det_loss_dict.get("cls_loss", torch.tensor(0.0, device=self.device)), 
-            det_loss_dict.get("dfl_loss", torch.tensor(0.0, device=self.device)),
-            relation_loss
-        ])
-        
-        # Set loss_items for the trainer to use
-        self.loss_items = loss_items.detach()
-        
-        # Update loss dictionary
-        loss_dict = {
-            **det_loss_dict,
-            "rel_loss": relation_loss,
-            "loss": total_loss
-        }
-        
-        return loss_dict
 
 
 

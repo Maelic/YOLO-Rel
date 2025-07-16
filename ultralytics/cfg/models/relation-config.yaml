@@ -1,0 +1,74 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Generic Relationship Detection Config
+# This config can be applied to any YOLO model to add relationship detection
+# Usage: specify base_model to inherit backbone and basic head structure
+
+# Base model configuration - can be overridden
+base_model: null  # Should be specified when loading (e.g., "yolo11n.pt", "yolov8n.pt", etc.)
+
+# Task type
+task: relation
+
+# Relationship detection parameters
+relation_classes: 56  # Number of relation classes (will be read from dataset config)
+nc: null  # Number of object classes (will be read from dataset config or base model)
+
+# Relationship model architecture parameters  
+relation_config:
+  feat_dim: 512           # Feature dimension for relationship processing
+  top_k: 100             # Number of top relationship pairs to consider during training/inference
+  hidden_dim: 256        # Hidden dimension for relationship classifier MLP
+  dropout: 0.1           # Dropout rate in relationship head
+  temperature: 8.0       # Temperature parameter for attention scaling
+  
+  # Feature extraction settings
+  pooling_type: "adaptive_avg"  # Type of pooling for anchor features: "adaptive_avg", "max", "avg"
+  feature_layers: [16, 19, 22]  # Which layers to extract features from (P3, P4, P5)
+  
+  # Attention mechanism settings
+  attention_type: "bilinear"    # Type of attention: "bilinear", "dot_product", "mlp"
+  normalize_features: true      # Whether to L2-normalize features before attention
+  
+  # Relationship classifier settings
+  classifier_layers: [512, 256] # Hidden layers in relationship classifier
+  use_batch_norm: true          # Whether to use batch normalization
+  activation: "relu"            # Activation function: "relu", "gelu", "swish"
+
+# Training hyperparameters for relationship detection
+relation_training:
+  # Loss weights
+  relation_loss_weight: 1.0     # Weight for relationship loss vs detection loss
+  pos_weight: 10.0              # Positive class weight for BCE loss (relations are sparse)
+  neg_weight: 1.0               # Negative class weight for BCE loss
+  
+  # Training strategy
+  freeze_backbone: false        # Whether to freeze backbone during relation training
+  warmup_epochs: 5             # Number of epochs to warm up relationship head only
+  
+  # Data augmentation
+  relation_mixup: 0.1          # Probability of mixing relationship labels
+  pair_dropout: 0.05           # Probability of dropping relationship pairs during training
+
+# Inference parameters
+relation_inference:
+  confidence_threshold: 0.5     # Minimum confidence for relationship predictions
+  nms_threshold: 0.5           # NMS threshold for overlapping relationships
+  max_relations_per_image: 100 # Maximum number of relations to output per image
+
+# Model scaling - these will be applied if base_model doesn't provide scales
+default_scales:
+  # [depth, width, max_channels] - can be overridden by base model
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024] 
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# Head configuration - will be merged with base model head
+relation_head:
+  # This section defines how to add the relationship head to any base model
+  # The RelationHead module will be automatically added after the detection head
+  module: "RelationHead"
+  args: ["${relation_classes}", "${relation_config.feat_dim}", "${relation_config.top_k}"]
+  input_layers: "${relation_config.feature_layers}"  # Which layers to get features from

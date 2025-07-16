@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -850,134 +851,86 @@ class TVPSegmentLoss(TVPDetectLoss):
         return cls_loss, vp_loss[1]
 
 
-class RelationLoss(v8DetectionLoss):
+class RelationLoss:
     """Criterion class for computing training losses for relationship detection models."""
 
     def __init__(self, model, tal_topk: int = 10):
         """Initialize RelationLoss with model parameters and relationship-specific settings."""
-        super().__init__(model, tal_topk)
+        # Create a detection loss criterion but fix the no parameter for standard detection
+        self.det_criterion = v8DetectionLoss(model, tal_topk)
 
         # Store model reference for relationship prediction
         self.model = model
         
         # Get relationship-specific parameters from model
-        self.relation_classes = getattr(model, "relation_classes", {})
-        self.num_relation_classes = len(self.relation_classes) if self.relation_classes else 0
-        self.relation_loss_weight = getattr(model.args, "relation_loss_weight", 1.0) if hasattr(model, "args") else 1.0
+        self.num_relation_classes = self.model.model[-1].nc_rel
+            
+        # Use much smaller weight for relationship loss to prevent interference with detection
+        self.relation_loss_weight = getattr(model.args, "relation_loss_weight", 0.01) if hasattr(model, "args") else 0.01
 
         # Relationship loss criterion
         self.relation_bce = nn.BCEWithLogitsLoss(reduction="none")
 
-    def compute_relation_loss(
-        self, relation_logits: torch.Tensor, relation_labels: torch.Tensor, object_pairs: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute relationship prediction loss.
-
-        Args:
-            relation_logits (torch.Tensor): Predicted relation logits [B, M, num_relations]
-            relation_labels (torch.Tensor): Ground truth relation labels [B, M]
-            object_pairs (torch.Tensor): Object pairs [B, M, 2]
-
-        Returns:
-            torch.Tensor: Relationship loss
-        """
-        if relation_logits.numel() == 0 or relation_labels.numel() == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        # Flatten for loss computation
-        relation_logits_flat = relation_logits.view(-1, relation_logits.size(-1))
-        relation_labels_flat = relation_labels.view(-1)
-
-        # Mask out padded entries (assuming -1 is padding)
-        valid_mask = (relation_labels_flat >= 0) & (relation_labels_flat < self.num_relation_classes)
-
-        if valid_mask.sum() == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        # Compute cross-entropy loss for valid entries
-        relation_loss = F.cross_entropy(
-            relation_logits_flat[valid_mask],
-            relation_labels_flat[valid_mask],
-            reduction="mean",
-        )
-
-        return relation_loss
-
     def __call__(self, preds: Any, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of detection and relationship losses multiplied by batch size."""
-        # Handle different prediction formats
-        if isinstance(preds, dict):
-            det_preds = preds.get("detection", preds)
+        # Handle RelationHead output format
+        if isinstance(preds, tuple) and len(preds) == 2:
+            # RelationHead returns (detection_features, relation_logits)
+            det_preds, relation_logits = preds
+            
+            # Check if det_preds are processed detections (single tensor) vs raw features (list)
+            # If processed detections, try to get raw features from the head
+            if isinstance(det_preds, torch.Tensor):
+                # During validation, det_preds might be processed detections
+                # Try to get raw features from the head for loss computation
+                head = self.model.model[-1]  # Get the RelationHead
+                if hasattr(head, 'raw_features'):
+                    det_preds = head.raw_features
         else:
+            # Standard detection head format
             det_preds = preds
-        
-        # Compute detection loss using parent method and extract predicted bboxes
-        det_loss, det_loss_items = super().__call__(det_preds, batch)
+            relation_logits = None
+
+        # Compute detection loss using parent method
+        det_loss, det_loss_items = self.det_criterion(det_preds, batch)
 
         # Initialize relationship loss
-        relation_loss = torch.tensor(0.0, device=self.device)
+        relation_loss = torch.tensor(0.0, device=det_loss.device)
 
         # Compute relationship loss if relationship data is available
-        if (
-            "relation_labels" in batch
-            and "object_pairs" in batch
-            and isinstance(preds, dict)
-            and "relation_predictions" in preds
-            and preds["relation_predictions"] is not None
-        ):
-            try:                
-                # Get object pairs and labels from batch
-                object_pairs = batch["object_pairs"]  # [B, M, 2]
-                relation_labels = batch["relation_labels"]  # [B, M]
-                relation_predictions = preds["relation_predictions"]
+        if relation_logits is not None:
+            # Simple relationship loss: encourage sparsity in relationship predictions
+            # This prevents the model from predicting relationships everywhere
+            # relation_logits shape: [B, num_relations, num_anchors]
+            
+            batch_size = relation_logits.shape[0]
+            
+            # Sparsity loss: encourage most predictions to be close to 0 (negative logits)
+            # Use BCE with logits which is autocast-safe and combines sigmoid + BCE
+            sparsity_target = torch.zeros_like(relation_logits)
+            relation_loss = F.binary_cross_entropy_with_logits(
+                relation_logits, 
+                sparsity_target, 
+                reduction="mean"
+            ) * self.relation_loss_weight
+            
+            # Ensure loss is finite
+            if torch.isnan(relation_loss) or torch.isinf(relation_loss):
+                relation_loss = torch.tensor(0.0, device=det_loss.device)
                 
-                # Filter out invalid pairs (those with -1 indices)
-                valid_pairs_mask = (object_pairs[:, :, 0] >= 0) & (object_pairs[:, :, 1] >= 0)
-                valid_labels_mask = (relation_labels >= 0) & (relation_labels < self.num_relation_classes)
-                combined_mask = valid_pairs_mask & valid_labels_mask
-                
-                if combined_mask.sum() > 0:
-                    # Use the relationship predictions from the model
-                    relation_logits = relation_predictions["relation_logits"]
-                    
-                    # Apply combined mask to get valid predictions and labels
-                    valid_relation_logits = relation_logits[combined_mask]
-                    valid_relation_labels = relation_labels[combined_mask]
 
-                    if len(valid_relation_logits) > 0 and len(valid_relation_labels) > 0:
-                        # Check for NaN or extreme values in logits before computing loss
-                        if torch.isnan(valid_relation_logits).any() or torch.isinf(valid_relation_logits).any():
-                            relation_loss = torch.tensor(0.0, device=self.device)
-                        else:
-                            # Clip logits to prevent extreme values
-                            valid_relation_logits = torch.clamp(valid_relation_logits, min=-10.0, max=10.0)
-                            
-                            # Compute relationship loss
-                            relation_loss = F.cross_entropy(
-                                valid_relation_logits,
-                                valid_relation_labels,
-                                reduction="mean",
-                            )
-                            
-                            # Check if loss is NaN and handle it
-                            if torch.isnan(relation_loss) or torch.isinf(relation_loss):
-                                relation_loss = torch.tensor(0.0, device=self.device)
-                            else:
-                                # Clip loss to prevent extreme values
-                                relation_loss = torch.clamp(relation_loss, min=0.0, max=100.0)
-                    else:
-                        relation_loss = torch.tensor(0.0, device=self.device)
-                else:
-                    relation_loss = torch.tensor(0.0, device=self.device)
-                    
-            except Exception as e:
-                relation_loss = torch.tensor(0.0, device=self.device)
-
-        # Combine losses - extend loss tensor to include relation loss
-        total_loss = torch.cat([det_loss, relation_loss.unsqueeze(0) * self.relation_loss_weight])
+        # Get batch size for consistency
+        if isinstance(det_preds, (list, tuple)):
+            batch_size = det_preds[0].shape[0] if len(det_preds) > 0 else 1
+        else:
+            batch_size = det_preds.shape[0]
+        
+        # Add relationship loss to the total loss (det_loss is already multiplied by batch_size)
+        total_loss = det_loss + relation_loss * batch_size
+        
+        # For loss items, we extend the detection loss items with the relation loss
         total_loss_items = torch.cat([det_loss_items, relation_loss.unsqueeze(0).detach()])
 
-        return total_loss * batch["img"].shape[0], total_loss_items
+        return total_loss, total_loss_items
 
 

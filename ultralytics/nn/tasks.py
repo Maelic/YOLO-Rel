@@ -55,6 +55,7 @@ from ultralytics.nn.modules import (
     Index,
     LRPCHead,
     Pose,
+    RelationHead,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -138,7 +139,7 @@ class BaseModel(torch.nn.Module):
             return self.loss(x, *args, **kwargs)
         return self.predict(x, *args, **kwargs)
 
-    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None, extract_features=False):
         """
         Perform a forward pass through the network.
 
@@ -148,15 +149,16 @@ class BaseModel(torch.nn.Module):
             visualize (bool): Save the feature maps of the model if True.
             augment (bool): Augment image during prediction.
             embed (list, optional): A list of feature vectors/embeddings to return.
+            extract_features (bool): If True, return raw feature maps from embed layers instead of avg pooled embeddings.
 
         Returns:
             (torch.Tensor): The last output of the model.
         """
         if augment:
             return self._predict_augment(x)
-        return self._predict_once(x, profile, visualize, embed)
+        return self._predict_once(x, profile, visualize, embed, extract_features)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    def _predict_once(self, x, profile=False, visualize=False, embed=None, extract_features=False):
         """
         Perform a forward pass through the network.
 
@@ -165,9 +167,11 @@ class BaseModel(torch.nn.Module):
             profile (bool): Print the computation time of each layer if True.
             visualize (bool): Save the feature maps of the model if True.
             embed (list, optional): A list of feature vectors/embeddings to return.
+            extract_features (bool): If True, return raw feature maps from embed layers instead of avg pooled embeddings.
 
         Returns:
             (torch.Tensor): The last output of the model.
+            (list): If extract_features=True and embed layers specified, returns list of feature maps.
         """
         y, dt, embeddings = [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
@@ -182,10 +186,28 @@ class BaseModel(torch.nn.Module):
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
-                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if extract_features:
+                    # Return raw feature maps instead of avg pooled embeddings
+                    embeddings.append(x)
+                else:
+                    # Original behavior: avg pool and flatten
+                    embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
                 if m.i == max_idx:
-                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
-        return x
+                    if not extract_features:
+                        return torch.unbind(torch.cat(embeddings, 1), dim=0)  # Return flattened embeddings
+        if extract_features:
+            # reshape features to maxchannel size of embed layers, upscale if necessary
+            max_size = max([emb.shape[-1] for emb in embeddings]) if embeddings else 0
+            for i, emb in enumerate(embeddings):
+                if isinstance(emb, torch.Tensor):
+                    if emb.shape[-1] < max_size:
+                        embeddings[i] = torch.nn.functional.interpolate(
+                            emb, size=(emb.shape[-2], max_size), mode='bilinear', align_corners=False
+                        )
+            LOGGER.info(f"Extracted {len(embeddings)} feature maps with shapes: {[emb.shape for emb in embeddings]}")
+            return x, embeddings  # Return raw feature maps
+        else:
+            return x
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -412,7 +434,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, RelationHead)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -1150,7 +1172,7 @@ class YOLOEModel(DetectionModel):
         return torch.cat(all_pe, dim=1)
 
     def predict(
-        self, x, profile=False, visualize=False, tpe=None, augment=False, embed=None, vpe=None, return_vpe=False
+        self, x, profile=False, visualize=False, tpe=None, augment=False, embed=None, vpe=None, return_vpe=False, extract_features=False
     ):
         """
         Perform a forward pass through the model.
@@ -1164,14 +1186,21 @@ class YOLOEModel(DetectionModel):
             embed (list, optional): A list of feature vectors/embeddings to return.
             vpe (torch.Tensor, optional): Visual positional embeddings.
             return_vpe (bool): If True, return visual positional embeddings.
+            extract_features (bool): If True, extract P3, P4, P5 feature maps for relationship prediction.
 
         Returns:
             (torch.Tensor): Model's output tensor.
         """
         y, dt, embeddings = [], [], []  # outputs
+        feature_maps = []  # for P3, P4, P5 feature extraction
         b = x.shape[0]
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
+        
+        # Define the layers where P3, P4, P5 features are extracted based on YOLOEModel architecture
+        # P3/8-small: layer 15, P4/16-medium: layer 18, P5/32-large: layer 21
+        feature_extraction_layers = {15, 18, 21} if extract_features else set()
+        
         for m in self.model:  # except the head part
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -1189,6 +1218,14 @@ class YOLOEModel(DetectionModel):
                 x = m(x, cls_pe)
             else:
                 x = m(x)  # run
+            
+            # Extract feature maps at P3, P4, P5 layers for relationship prediction
+            if extract_features and m.i in feature_extraction_layers:
+                if isinstance(x, (list, tuple)):
+                    # If x is a list/tuple (like from Concat layers), take the appropriate element
+                    feature_maps.append(x[0] if len(x) == 1 else x)
+                else:
+                    feature_maps.append(x)
 
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
@@ -1197,6 +1234,10 @@ class YOLOEModel(DetectionModel):
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        
+        # Return both predictions and feature maps if requested
+        if extract_features:
+            return x, feature_maps
         return x
 
     def loss(self, batch, preds=None):
@@ -1208,10 +1249,7 @@ class YOLOEModel(DetectionModel):
             preds (torch.Tensor | List[torch.Tensor], optional): Predictions.
         """
         if not hasattr(self, "criterion"):
-            from ultralytics.utils.loss import TVPDetectLoss
-
-            visual_prompt = batch.get("visuals", None) is not None  # TODO
-            self.criterion = TVPDetectLoss(self) if visual_prompt else self.init_criterion()
+            self.criterion = self.init_criterion()
 
         if preds is None:
             preds = self.forward(batch["img"], tpe=batch.get("txt_feats", None), vpe=batch.get("visuals", None))
@@ -1264,6 +1302,86 @@ class YOLOESegModel(YOLOEModel, SegmentationModel):
         if preds is None:
             preds = self.forward(batch["img"], tpe=batch.get("txt_feats", None), vpe=batch.get("visuals", None))
         return self.criterion(preds, batch)
+
+
+class RelationModel(DetectionModel):
+    """
+    YOLO Relationship Detection model.
+
+    This class extends DetectionModel to include relationship prediction capabilities between detected objects.
+    The model uses the standard YOLO detection pipeline but adds a RelationHead that inherits from Detect
+    for predicting relationships between detected objects.
+
+    Attributes:
+        nc_rel (int): Number of relationship classes.
+
+    Methods:
+        __init__: Initialize relationship detection model.
+        init_criterion: Initialize loss criterion for relationship detection.
+
+    Examples:
+        Initialize a relationship detection model
+        >>> model = RelationModel("yolo11n.yaml", ch=3, nc=80, nc_rel=56)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, nc_rel=56, relation_classes=None, verbose=True):
+        """
+        Initialize relationship detection model with given config and parameters.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of object classes.
+            nc_rel (int): Number of relationship classes.
+            relation_classes (dict | list, optional): Relationship class names.
+            verbose (bool): Whether to display model information.
+        """
+        # Handle relation_classes parameter for compatibility with trainer
+        if relation_classes is not None:
+            if isinstance(relation_classes, dict):
+                nc_rel = len(relation_classes)
+            elif isinstance(relation_classes, list):
+                nc_rel = len(relation_classes)
+        
+        self.nc_rel = nc_rel
+        
+        # Initialize the base detection model first
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        
+        # Now replace the standard Detect head with RelationHead while preserving attributes
+        original_head = self.model[-1]
+        
+        assert isinstance(original_head, RelationHead), (
+            f"Expected the last model layer to be RelationHead, but got {type(original_head)}."
+        )
+
+    def load_detection_weights(self, weight_path, verbose=True):
+        """
+        Load detection model weights into this relation model.
+        
+        This enables transfer learning from any YOLO detection model by intelligently
+        transferring compatible weights while leaving the relation head randomly initialized.
+        
+        Args:
+            weight_path (str): Path to detection model checkpoint (.pt file)
+            verbose (bool): Whether to print transfer details
+            
+        Returns:
+            dict: Transfer statistics
+            
+        Examples:
+            >>> relation_model = RelationModel("yolo11n-rel.yaml")
+            >>> stats = relation_model.load_detection_weights("yolo11n.pt")
+            >>> print(f"Loaded {stats['total_loaded']} weights")
+        """
+        return load_detection_weights_to_relation_model(self, weight_path, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for relationship detection."""
+        from ultralytics.utils.loss import RelationLoss
+        return RelationLoss(self)
+
 
 
 class Ensemble(torch.nn.ModuleList):
@@ -1501,7 +1619,7 @@ def attempt_load_weights(weights, device=None, inplace=True, fuse=False):
     ensemble = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:
         ckpt, w = torch_safe_load(w)  # load ckpt
-        args = {**DEFAULT_CFG_DICT, **ckpt["train_args"]} if "train_args" in ckpt else None  # combined args
+        args = {**DEFAULT_CFG_DICT, **ckpt["train_args"]}  # combined args
         model = (ckpt.get("ema") or ckpt["model"]).to(device).float()  # FP32 model
 
         # Model compatibility updates
@@ -1590,7 +1708,7 @@ def parse_model(d, ch, verbose=True):
     # Args
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
-    nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
+    nc, act, scales, relation_classes = (d.get(x) for x in ("nc", "activation", "scales", "relation_classes"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     if scales:
         scale = d.get("scale")
@@ -1715,7 +1833,7 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, RelationHead}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
@@ -1860,3 +1978,187 @@ def guess_model_task(model):
         "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
     )
     return "detect"  # assume detect
+
+
+def load_detection_weights_to_relation_model(relation_model, detection_weight_path, verbose=True):
+    """
+    Load detection model weights into a relation model with intelligent weight transfer.
+    
+    This function enables transfer learning from any YOLO detection model to a relation
+    detection model by:
+    1. Loading all compatible backbone weights
+    2. Partially transferring detection head weights (bbox regression layers)
+    3. Intelligently initializing classification layers with pretrained features
+    4. Leaving relation head weights randomly initialized for training
+    
+    Args:
+        relation_model (RelationModel): Target relation model to load weights into
+        detection_weight_path (str): Path to detection model checkpoint (.pt file)
+        verbose (bool): Whether to print detailed transfer information
+        
+    Returns:
+        dict: Transfer statistics including loaded, transferred, and excluded counts
+        
+    Examples:
+        >>> from ultralytics import YOLO
+        >>> relation_model = YOLO('yolo11n-rel.yaml', task='relation')
+        >>> stats = load_detection_weights_to_relation_model(relation_model.model, 'yolo11n.pt')
+        >>> print(f"Loaded {stats['total_loaded']} weights from detection model")
+    """
+    try:
+        # Load detection checkpoint
+        if verbose:
+            LOGGER.info(f"Loading detection weights from {detection_weight_path}")
+            
+        checkpoint = torch.load(detection_weight_path, map_location="cpu", weights_only=False)
+        if "model" not in checkpoint:
+            raise ValueError(f"Invalid checkpoint format: 'model' key not found in {detection_weight_path}")
+            
+        pretrained_state = checkpoint["model"].state_dict()
+        relation_state = relation_model.state_dict()
+        
+        # Initialize transfer tracking
+        compatible_weights = {}
+        excluded_keys = []
+        backbone_weights = 0
+        head_weights = 0
+        partial_transfers = 0
+        
+        if verbose:
+            LOGGER.info(f"Source model: {len(pretrained_state)} parameters")
+            LOGGER.info(f"Target model: {len(relation_state)} parameters")
+            
+        # Process each pretrained weight
+        for key, pretrained_weight in pretrained_state.items():
+            if key not in relation_state:
+                # Key doesn't exist in relation model (e.g., old detection head layers)
+                excluded_keys.append(key)
+                continue
+                
+            relation_weight = relation_state[key]
+            
+            if pretrained_weight.shape == relation_weight.shape:
+                # Direct shape match - transfer as-is
+                compatible_weights[key] = pretrained_weight
+                if "model.23." in key:  # Detection head
+                    head_weights += 1
+                else:  # Backbone
+                    backbone_weights += 1
+                    
+            elif "model.23." in key:
+                # Detection head with different dimensions - try partial transfer
+                success = False
+                
+                if "cv3" in key and "weight" in key and len(pretrained_weight.shape) == 4:
+                    # Classification convolution weights: [out_channels, in_channels, H, W]
+                    pretrained_out, in_ch, h, w = pretrained_weight.shape
+                    target_out, target_in_ch, target_h, target_w = relation_weight.shape
+                    
+                    if in_ch == target_in_ch and h == target_h and w == target_w:
+                        # Same input dimensions, different output classes
+                        new_weight = relation_weight.clone()  # Start with target (random) weights
+                        min_classes = min(pretrained_out, target_out)
+                        new_weight[:min_classes] = pretrained_weight[:min_classes]  # Copy what we can
+                        compatible_weights[key] = new_weight
+                        partial_transfers += 1
+                        success = True
+                        
+                        if verbose:
+                            LOGGER.info(f"  Partial transfer {key}: {min_classes}/{target_out} classes from pretrained")
+                            
+                elif "cv3" in key and "bias" in key and len(pretrained_weight.shape) == 1:
+                    # Classification bias: [out_channels]
+                    pretrained_out = pretrained_weight.shape[0]
+                    target_out = relation_weight.shape[0]
+                    
+                    new_bias = relation_weight.clone()  # Start with target (random) bias
+                    min_classes = min(pretrained_out, target_out)
+                    new_bias[:min_classes] = pretrained_weight[:min_classes]  # Copy what we can
+                    compatible_weights[key] = new_bias
+                    partial_transfers += 1
+                    success = True
+                    
+                    if verbose:
+                        LOGGER.info(f"  Partial transfer {key}: {min_classes}/{target_out} classes from pretrained")
+                        
+                elif "cv2" in key or "dfl" in key:
+                    # Bbox regression or DFL layers - only transfer if exact match
+                    if pretrained_weight.shape == relation_weight.shape:
+                        compatible_weights[key] = pretrained_weight
+                        head_weights += 1
+                        success = True
+                    
+                if not success:
+                    excluded_keys.append(key)
+            else:
+                # Backbone layer with shape mismatch - exclude
+                excluded_keys.append(key)
+                if verbose and "model.23." not in key:  # Don't spam about expected head mismatches
+                    LOGGER.warning(f"Shape mismatch for {key}: {pretrained_weight.shape} vs {relation_weight.shape}")
+        
+        # Load the transferred weights
+        if compatible_weights:
+            missing_keys, unexpected_keys = relation_model.load_state_dict(compatible_weights, strict=False)
+            
+            # Prepare transfer statistics
+            total_loaded = len(compatible_weights)
+            total_excluded = len(excluded_keys)
+            
+            # Log transfer summary
+            if verbose:
+                LOGGER.info(f"✅ Weight Transfer Summary:")
+                LOGGER.info(f"   • Backbone weights: {backbone_weights}")
+                LOGGER.info(f"   • Detection head weights: {head_weights}")
+                LOGGER.info(f"   • Partial transfers: {partial_transfers}")
+                LOGGER.info(f"   • Total loaded: {total_loaded}/{len(relation_state)}")
+                LOGGER.info(f"   • Excluded: {total_excluded} incompatible weights")
+                
+                if partial_transfers > 0:
+                    LOGGER.info(f"   • Classification layers partially initialized with pretrained features")
+                    
+                # Count new relation head parameters
+                relation_head_params = len([k for k in relation_state.keys() if "cv4" in k])
+                if relation_head_params > 0:
+                    LOGGER.info(f"   • Relation head: {relation_head_params} new parameters (randomly initialized)")
+            
+            # Return transfer statistics
+            return {
+                'total_loaded': total_loaded,
+                'backbone_weights': backbone_weights,
+                'head_weights': head_weights,
+                'partial_transfers': partial_transfers,
+                'excluded_weights': total_excluded,
+                'missing_keys': missing_keys,
+                'unexpected_keys': unexpected_keys,
+                'success': True
+            }
+        else:
+            if verbose:
+                LOGGER.warning("⚠️ No compatible weights found to transfer")
+            return {
+                'total_loaded': 0,
+                'backbone_weights': 0,
+                'head_weights': 0,
+                'partial_transfers': 0,
+                'excluded_weights': len(excluded_keys),
+                'missing_keys': [],
+                'unexpected_keys': [],
+                'success': False
+            }
+            
+    except Exception as e:
+        if verbose:
+            LOGGER.error(f"❌ Failed to load detection weights: {e}")
+            import traceback
+            traceback.print_exc()
+        return {
+            'total_loaded': 0,
+            'backbone_weights': 0,
+            'head_weights': 0,
+            'partial_transfers': 0,
+            'excluded_weights': 0,
+            'missing_keys': [],
+            'unexpected_keys': [],
+            'success': False,
+            'error': str(e)
+        }

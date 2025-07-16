@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.detect import DetectionPredictor
-from ultralytics.utils import LOGGER, ops
+from ultralytics.utils import LOGGER, ops, DEFAULT_CFG
 
 
 class RelationPredictor(DetectionPredictor):
@@ -32,7 +32,7 @@ class RelationPredictor(DetectionPredictor):
         ...     print(f"Detected {len(result.relations)} relationships")
     """
     
-    def __init__(self, cfg=None, overrides=None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
         Initialize RelationPredictor.
         
@@ -74,14 +74,17 @@ class RelationPredictor(DetectionPredictor):
                 # Process relationships
                 relations = self._process_relations(pred, relation_pred)
                 
-                # Create Results object
-                results.append(Results(
+                # Create Results object (without relations parameter)
+                result = Results(
                     orig_img=orig_img,
                     path=img_path,
                     names=self.model.names,
-                    boxes=pred[:, :6] if len(pred) else torch.zeros(0, 6),
-                    relations=relations
-                ))
+                    boxes=pred[:, :6] if len(pred) else torch.zeros(0, 6)
+                )
+                
+                # Add relations as a custom attribute
+                result.relations = relations
+                results.append(result)
             
             return results
         else:

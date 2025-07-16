@@ -1094,6 +1094,18 @@ class YOLORelationDataset(YOLODataset):
         else:
             all_relations = relations
         
+        # Handle empty relations case
+        if len(all_relations) == 0:
+            return {
+                "relation_labels": torch.zeros((0,), dtype=torch.long),
+                "object_pairs": torch.zeros((0, 2), dtype=torch.long),
+                "num_relations": 0
+            }
+        
+        # Ensure tensor is 2D
+        if all_relations.dim() == 1:
+            all_relations = all_relations.unsqueeze(0)
+        
         # Limit number of relations per image
         if len(all_relations) > self.max_relations_per_image:
             indices = torch.randperm(len(all_relations))[:self.max_relations_per_image]

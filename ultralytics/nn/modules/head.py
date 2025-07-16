@@ -3,7 +3,7 @@
 
 import copy
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "RelationHead"
 
 
 class Detect(nn.Module):
@@ -613,7 +613,7 @@ class YOLOEDetect(Detect):
         fuse: Fuse text features with model weights for efficient inference.
         get_tpe: Get text prompt embeddings with normalization.
         get_vpe: Get visual prompt embeddings with spatial awareness.
-        forward_lrpc: Process features with fused text embeddings for prompt-free model.
+        forward_lrpc: Process features with fused text embeddings to generate detections for prompt-free model.
         forward: Process features with class prompt embeddings to generate detections.
         bias_init: Initialize biases for detection heads.
 
@@ -782,7 +782,6 @@ class YOLOEDetect(Detect):
             # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
             b[-1].bias.data[:] = 0.0
             c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
-
 
 class YOLOESegment(YOLOEDetect):
     """
@@ -1226,3 +1225,95 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
+
+class RelationHead(Detect):
+    """
+    YOLO Relationship Detection head for predicting relationships between detected objects.
+
+    This head extends the Detect head to include relationship prediction capabilities. It maintains all
+    the object detection functionality while adding relationship classification between object pairs.
+    Following the same pattern as Segment, OBB, and Pose heads.
+
+    Attributes:
+        nc_rel (int): Number of relationship classes.
+        cv4 (nn.ModuleList): Convolution layers for relationship prediction.
+
+    Methods:
+        forward: Perform forward pass and return detection predictions with relationship outputs.
+
+    Examples:
+        Create a relationship detection head
+        >>> relation = RelationHead(nc=80, nc_rel=56, ch=(256, 512, 1024))
+        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+        >>> outputs = relation(x)
+    """
+
+    def __init__(self, nc: int = 80, nc_rel: int = 56, ch: Tuple = ()):
+        """
+        Initialize RelationHead with object detection and relationship prediction capabilities.
+
+        Args:
+            nc (int): Number of object classes.
+            nc_rel (int): Number of relationship classes.
+            ch (tuple): Input channel sizes from backbone feature maps.
+        """
+        super().__init__(nc, ch)
+            
+        self.nc_rel = nc_rel  # number of relationship classes
+              
+        # Relationship prediction layers following the same pattern as other heads
+        c4 = max(ch[0] // 4, self.nc_rel)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nc_rel, 1)) for x in ch
+        )
+
+    def forward(self, x: List[torch.Tensor]) -> Union[torch.Tensor, Tuple]:
+        """
+        Perform forward pass through relationship detection head.
+
+        Args:
+            x (List[torch.Tensor]): Multi-scale feature maps from backbone.
+
+        Returns:
+            During training: (detection_outputs, relation_logits) 
+            During inference: (detection_tensor, relation_logits) for validation
+        """
+        bs = x[0].shape[0]  # batch size
+        
+        x2 = [x[i].clone() for i in range(self.nl)]  # clone input features to avoid modifying original
+
+        # Standard detection forward pass
+        detection_outputs = Detect.forward(self, x)
+
+        # Relationship prediction (following same pattern as OBB, Pose, Segment)
+        relation_logits = torch.cat([self.cv4[i](x2[i]).view(bs, self.nc_rel, -1) for i in range(self.nl)], 2)
+        
+        # Store relation outputs as attribute (similar to OBB head storing angle)
+        if not self.training:
+            self.relation_logits = relation_logits
+            # Store raw features for loss computation during validation
+            if isinstance(detection_outputs, tuple) and len(detection_outputs) == 2:
+                processed_detections, raw_features = detection_outputs
+                self.raw_features = raw_features
+            else:
+                self.raw_features = detection_outputs
+
+        if self.training:
+            # During training, return both detection outputs and relationship outputs
+            # detection_outputs is a list of raw feature tensors
+            return detection_outputs, relation_logits
+        
+        # During inference/validation
+        if self.export:
+            # For export, concatenate everything into single tensor
+            return torch.cat([detection_outputs, relation_logits], 1)
+        else:
+            # For validation, return processed detections and relation logits for postprocessing
+            if isinstance(detection_outputs, tuple) and len(detection_outputs) == 2:
+                # detection_outputs is (y, x) where y is processed detections, x is raw features
+                processed_detections, raw_features = detection_outputs
+                # Return processed detections and relation logits for postprocessing
+                return processed_detections, relation_logits
+            else:
+                # Fallback: return detection outputs and relation logits
+                return detection_outputs, relation_logits

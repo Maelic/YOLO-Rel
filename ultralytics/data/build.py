@@ -189,7 +189,7 @@ def build_yolo_relation_dataset(cfg, img_path, batch, data, relation_file, mode=
         negative_sampling=mode == "train",
         max_relations_per_image=getattr(cfg, 'max_relations_per_image', 100),
     )
-    
+
     return dataset
 
 def build_dataloader(dataset, batch: int, workers: int, shuffle: bool = True, rank: int = -1, drop_last: bool = False):

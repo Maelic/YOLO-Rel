@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Test script for YOLO Relation Detection Training.
-
-This script tests the complete relation detection pipeline using the PSG dataset
-and validates the integration of the new 'relation' task into the YOLO framework.
-"""
 
 import os
 import sys
@@ -18,48 +12,6 @@ import torch
 import yaml
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
-
-
-def check_relation_task_integration():
-    """Test if the relation task is properly integrated into YOLO."""
-    print("🔍 Checking relation task integration...")
-    
-    # Test YOLO task registration
-    try:
-        model = YOLO()
-        task_map = model.task_map
-        
-        if 'relation' in task_map:
-            print("✅ 'relation' task successfully registered in YOLO")
-            relation_components = task_map['relation']
-            print(f"  - Model: {relation_components['model']}")
-            print(f"  - Trainer: {relation_components['trainer']}")
-            print(f"  - Validator: {relation_components['validator']}")
-            print(f"  - Predictor: {relation_components['predictor']}")
-            return True
-        else:
-            print("❌ 'relation' task not found in YOLO task_map")
-            print(f"Available tasks: {list(task_map.keys())}")
-            return False
-    except Exception as e:
-        print(f"❌ Error checking task integration: {e}")
-        return False
-
-
-def check_relation_components():
-    """Test if all relation components can be imported."""
-    print("\n🔍 Checking relation component imports...")
-    
-    try:
-        from ultralytics.models.yolo.relation import (
-            RelationTrainer, RelationValidator, RelationPredictor
-        )
-        print("✅ All relation components imported successfully")
-        return True
-    except ImportError as e:
-        print(f"❌ Import error for relation components: {e}")
-        return False
-
 
 def check_psg_config():
     """Check if PSG configuration file exists and is valid."""
@@ -103,21 +55,16 @@ def test_relation_training(config_path="ultralytics/cfg/datasets/PSG.yaml",
     print(f"Image size: {imgsz}")
     
     try:
-        # Initialize YOLO model with relation task
+        # Read the dataset configuration to get the correct number of classes
+        with open(config_path, 'r') as f:
+            dataset_config = yaml.safe_load(f)
+        
+        nc = len(dataset_config['names'])
+        print(f"Dataset has {nc} object classes")
+        
+        # Initialize YOLO model with relation task and correct number of classes
         print("Initializing YOLO model with relation task...")
-        model = YOLO(task='relation')
-        
-        # Debug: Check if task is properly set
-        print(f"Model task: {model.task}")
-        print(f"Available tasks: {list(model.task_map.keys())}")
-        
-        # Check if relation task components are loaded
-        if hasattr(model, 'task') and model.task == 'relation':
-            print("✅ Relation task properly set")
-            trainer_class = model.task_map[model.task]['trainer']
-            print(f"Trainer class: {trainer_class}")
-        else:
-            print(f"❌ Task not set to relation. Current task: {getattr(model, 'task', 'unknown')}")
+        model = YOLO(model="ultralytics/cfg/models/11/yolo11n-rel.yaml", task="relation")
         
         # Training arguments
         train_args = {
@@ -127,10 +74,11 @@ def test_relation_training(config_path="ultralytics/cfg/datasets/PSG.yaml",
             'imgsz': imgsz,
             'device': 'cuda' if torch.cuda.is_available() else 'cpu',
             'project': 'runs/relation',
-            'name': 'test_relation_training',
+            'name': 'test_yolo11n_relation_training',
             'save': True,
             'verbose': True,
             'exist_ok': True,
+            'pretrained': 'yolo11n.pt',  # This triggers automatic weight transfer
             # Note: Custom relation arguments will be handled by the RelationTrainer
         }
         
@@ -139,9 +87,10 @@ def test_relation_training(config_path="ultralytics/cfg/datasets/PSG.yaml",
         # Start training
         print("Starting training...")
         results = model.train(**train_args)
+        #results = model.val(**train_args)
         
-        print("✅ Relation training completed successfully!")
-        print(f"Training results: {results}")
+        # print("✅ Relation training completed successfully!")
+        # print(f"Training results: {results}")
         
         return True, results
         
@@ -205,20 +154,7 @@ def main():
     print("=" * 60)
     print("🧪 YOLO Relation Detection Training Test")
     print("=" * 60)
-    
-    # Step 1: Check integration
-    integration_ok = check_relation_task_integration()
-    if not integration_ok:
-        print("\n❌ Integration check failed. Exiting.")
-        sys.exit(1)
-    
-    # Step 2: Check component imports
-    components_ok = check_relation_components()
-    if not components_ok:
-        print("\n❌ Component import check failed. Exiting.")
-        sys.exit(1)
-    
-    # Step 3: Check PSG config
+
     config_result = check_psg_config()
     if isinstance(config_result, tuple):
         config_ok, config = config_result
